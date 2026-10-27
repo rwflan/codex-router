@@ -1,0 +1,1 @@
+- **Meta Muse requests no longer fail on Codex's encrypted-output include.** The Meta Responses adapter removes the unsupported `output.encrypted_content` option while preserving `reasoning.encrypted_content`, other includes, and other providers' requests.

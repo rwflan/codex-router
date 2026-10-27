@@ -8040,6 +8040,56 @@ test("API forwarder drops the search_content_types Meta refuses, and only for Me
   }
 });
 
+test("API forwarder removes Meta's unsupported encrypted output include only", async () => {
+  const bodies = [];
+  const upstream = await mockServer(async (request, response) => {
+    const body = await bodyJson(request);
+    bodies.push(body);
+    const rejected = body.model.startsWith("muse-") &&
+      body.include?.includes("output.encrypted_content");
+    json(response, rejected ? 400 : 200, rejected
+      ? { error: { message: "unknown variant output.encrypted_content" } }
+      : { id: "resp_include", object: "response", status: "completed", output: [] });
+  });
+  const port = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(port),
+    META_BASE_URL: `http://127.0.0.1:${upstream.port}/v1`,
+    META_API_KEY: "TEST_META_API_KEY",
+    OPENCODE_GO_BASE_URL: `http://127.0.0.1:${upstream.port}/v1`,
+    OPENCODE_GO_API_KEY: "TEST_OPENCODE_GO_API_KEY",
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const send = async (model, include) => {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model, input: "test", ...(include === undefined ? {} : { include }) }),
+    });
+    assert.equal(response.status, 200, `${await response.text()}\n${forwarder.testErrors()}`);
+    return bodies.at(-1);
+  };
+  try {
+    await waitFor(`http://127.0.0.1:${port}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    const include = ["reasoning.encrypted_content", "output.encrypted_content", "web_search_call.action.sources"];
+    for (const model of ["meta-muse-spark-1-3-contributor", "meta-muse-spark-1-3"]) {
+      assert.deepEqual((await send(model, include)).include,
+        ["reasoning.encrypted_content", "web_search_call.action.sources"]);
+    }
+    const model = "meta-muse-spark-1-3-contributor";
+    assert.equal((await send(model, ["output.encrypted_content"])).include, undefined);
+    assert.equal((await send(model)).include, undefined);
+    assert.deepEqual((await send(model, ["reasoning.encrypted_content"])).include,
+      ["reasoning.encrypted_content"]);
+    assert.deepEqual((await send("responses/opencode-go-responses-gpt-5-6-luna", include)).include, include);
+  } finally {
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+  }
+});
+
 test("router strips Fireworks web_search_options on routed and compaction requests", async () => {
   const gatewayRequests = [];
   const gateway = await mockServer(async (request, response) => {
