@@ -1168,6 +1168,13 @@ function normalizeBody(buffer, contentType, route) {
   if (provider.id === "meta" && Array.isArray(payload.tools)) {
     payload.tools = stripSearchContentTypes(payload.tools);
   }
+  // Current Codex requests encrypted output, but Meta's Responses schema only
+  // accepts reasoning.encrypted_content. Preserve that supported include and
+  // all other entries; this is an output hint, not input history to rewrite.
+  if (provider.id === "meta" && route === "/responses" && Array.isArray(payload.include)) {
+    payload.include = payload.include.filter((entry) => entry !== "output.encrypted_content");
+    if (payload.include.length === 0) delete payload.include;
+  }
   // Strip empty tools array and dangling tool_choice for all routes.
   // Strict upstreams (vLLM >=0.20 Pydantic) refuse both, and Codex sends
   // tools: [] on compaction and plain chat. Log when a request is changed.
