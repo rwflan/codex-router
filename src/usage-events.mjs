@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import path from "node:path";
 
+import { knownGenerationOutcome } from "./response-outcome.mjs";
 import { STATE_DIR } from "./paths.mjs";
 import { canonicalProviderId } from "./provider-selection.mjs";
 import { acceptedInputTokens } from "./context-window-drift.mjs";
@@ -64,6 +65,28 @@ function safeRetryCount(value) {
   return count ? count : undefined;
 }
 
+const ATTEMPT_ERROR_CODES = new Set([
+  "EADDRNOTAVAIL", "ECONNABORTED", "ECONNREFUSED", "ECONNRESET", "EAI_AGAIN",
+  "EHOSTUNREACH", "ENETDOWN", "ENETUNREACH", "ENOBUFS", "ENOTFOUND", "EPIPE",
+  "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_SOCKET",
+]);
+
+function safeUpstreamAttempts(value) {
+  if (!Array.isArray(value)) return undefined;
+  const attempts = value.slice(0, 6).filter((entry) => entry &&
+    Number.isInteger(entry.attempt) && entry.attempt >= 1 && entry.attempt <= 6 &&
+    ["not_sent", "possibly_sent", "response_started"].includes(entry.deliveryState))
+    .map((entry) => ({
+      attempt: entry.attempt,
+      deliveryState: entry.deliveryState,
+      durationMs: safeTokenCount(entry.durationMs) ?? 0,
+      retryScheduled: entry.retryScheduled === true,
+      ...(Number.isInteger(entry.status) && entry.status >= 100 && entry.status <= 599 ? { status: entry.status } : {}),
+      ...(ATTEMPT_ERROR_CODES.has(entry.errorCode) ? { errorCode: entry.errorCode } : {}),
+    }));
+  return attempts.length ? attempts : undefined;
+}
+
 // Every field an event can carry is named in this destructuring, and the writer
 // below only emits the ones it knows about: anything a caller passes that is not
 // listed here is dropped silently, with no error and no trace. Three image-budget
@@ -74,6 +97,10 @@ export function recordUsageEvent({
   model,
   provider,
   status,
+  upstreamAttempts,
+  deliveryPolicy,
+  httpStatus,
+  generationOutcome,
   durationMs,
   // Milliseconds from receiving the request until the upstream response
   // headers arrived. Together with durationMs this isolates the streamed
@@ -139,11 +166,9 @@ export function recordUsageEvent({
   // explicitly if the retry also reaches the limit; historical routers used
   // `emptyCompletionGuardReleased` for the old fail-open behavior above.
   emptyCompletionPreludeLimit,
-  // Present only when the router replaced an upstream `input_tokens: 0` with
-  // its own estimate on the way to Codex (#95). The reported counts above stay
-  // exactly as the provider sent them, so an estimated turn is never mistaken
-  // for the provider having recovered -- and a run of these events is the
-  // signal that it has not.
+  // Client context estimate substituted for a missing zero count (#95) or
+  // Grok's cumulative agentic input billing. Raw provider counts above remain
+  // unchanged for metering; this value is not a measured provider token count.
   estimatedInputTokens,
   // True when the router canceled a request at its separately configured
   // execution deadline. Activity-record retention never sets this field.
@@ -191,6 +216,7 @@ export function recordUsageEvent({
   // Router-generated correlation id. Matches /activity's `requestId`. Optional so
   // historical rows keep their exact shape.
   requestId,
+  requestKind,
   // Grok OAuth 4.6 ingress UTF-8 JSON byte split. Optional, bounded, and never
   // a token estimate. Missing payload fields measure as zero.
   contextBytes,
@@ -198,15 +224,22 @@ export function recordUsageEvent({
   reasoningEffort,
   providerToolCount,
   providerToolSchemaBytes,
+  // The free/auto pool this row's attempt belonged to, and why the pool moved
+  // past it. Absent on every row outside the pool.
+  freePool,
+  freePoolReason,
   at = Date.now(),
 }) {
   const diagnostics = usageDiagnosticMetadata({
     requestId,
+    requestKind,
     contextBytes,
     grokStructuredPatch,
     reasoningEffort,
     providerToolCount,
     providerToolSchemaBytes,
+    freePool,
+    freePoolReason,
   });
   const event = {
     ...serviceTierMetadata({
@@ -221,6 +254,10 @@ export function recordUsageEvent({
     model: safeText(model, "unknown"),
     provider: safeText(provider, "unknown"),
     status: Number.isInteger(status) ? status : 0,
+    ...(safeUpstreamAttempts(upstreamAttempts) ? { upstreamAttempts: safeUpstreamAttempts(upstreamAttempts) } : {}),
+    ...(["at-most-once", "availability"].includes(deliveryPolicy) ? { deliveryPolicy } : {}),
+    ...(Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599 ? { httpStatus } : {}),
+    ...(knownGenerationOutcome(generationOutcome) ? { generationOutcome } : {}),
     durationMs: Number.isFinite(durationMs) ? Math.max(0, Math.round(durationMs)) : 0,
     ...(safeTokenCount(responseStartMs) !== undefined
       ? { responseStartMs: safeTokenCount(responseStartMs) }
@@ -541,11 +578,14 @@ export function recentUsageEvents({
         const searchResults = safeTokenCount(event.searchResults);
         const diagnostics = usageDiagnosticMetadata({
           requestId: event.requestId,
+          requestKind: event.requestKind,
           contextBytes: event.contextBytes,
           grokStructuredPatch: event.grokStructuredPatch,
           reasoningEffort: event.reasoningEffort,
           providerToolCount: event.providerToolCount,
           providerToolSchemaBytes: event.providerToolSchemaBytes,
+          freePool: event.freePool,
+          freePoolReason: event.freePoolReason,
         });
         return {
           ...serviceTierMetadata(event),
@@ -557,6 +597,14 @@ export function recentUsageEvents({
           // series per subscription.
           provider: canonicalProviderId(safeText(event.provider, "unknown")),
           status: Number.isInteger(event.status) ? event.status : 0,
+          // The free/auto usage view counts fallbacks from this field.
+          ...(typeof event.failoverFrom === "string" && event.failoverFrom.trim()
+            ? { failoverFrom: safeText(event.failoverFrom, "unknown") }
+            : {}),
+          ...(safeUpstreamAttempts(event.upstreamAttempts) ? { upstreamAttempts: safeUpstreamAttempts(event.upstreamAttempts) } : {}),
+          ...(["at-most-once", "availability"].includes(event.deliveryPolicy) ? { deliveryPolicy: event.deliveryPolicy } : {}),
+          ...(Number.isInteger(event.httpStatus) && event.httpStatus >= 100 && event.httpStatus <= 599 ? { httpStatus: event.httpStatus } : {}),
+          ...(knownGenerationOutcome(event.generationOutcome) ? { generationOutcome: event.generationOutcome } : {}),
           durationMs: Number.isFinite(event.durationMs)
             ? Math.max(0, Math.round(event.durationMs))
             : 0,
@@ -632,9 +680,15 @@ export const HOURLY_USAGE_ROLLUP_HOURS = 24;
 // recentUsageEvents() omits an absent count rather than writing a zero, so an
 // unreported field stays distinguishable from a measured zero.
 function rollupTokenCount(event) {
-  if (event.totalTokens !== undefined) return event.totalTokens;
   const input = event.billedInputTokens ?? event.inputTokens;
   const output = event.billedOutputTokens ?? event.outputTokens;
+  // A retry row retains the selected response's total as well as the cost of
+  // every attempt. Match provider-usage: billed counts take precedence, with
+  // the raw component filling in only when its billed count is absent.
+  if (event.billedInputTokens !== undefined || event.billedOutputTokens !== undefined) {
+    return (input ?? 0) + (output ?? 0);
+  }
+  if (event.totalTokens !== undefined) return event.totalTokens;
   if (input === undefined && output === undefined) return undefined;
   return (input ?? 0) + (output ?? 0);
 }

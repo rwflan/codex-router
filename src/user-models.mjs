@@ -51,10 +51,11 @@ export function hasDefaultUserModelReasoning(entry) {
   );
 }
 
-// Curation may adjust presentation, sizing, and effort metadata only;
-// identity and routing fields always come from the provider id and the
+// Curation may adjust presentation, sizing, effort and explicit compatibility
+// metadata; identity and routing fields always come from the provider id and the
 // discovered model id.
 const METADATA_FIELDS = new Set([
+  "repetitionGuard",
   "displayName",
   "description",
   "contextWindow",
@@ -69,9 +70,13 @@ const METADATA_FIELDS = new Set([
   "availabilityNux",
   "upgradeTo",
   "requiresTrailingUserTurn",
+  "goalContinuationGuard",
   "isFree",
   "toolSchemaRecursion",
   "supportedEndpoints",
+  "reasoningTagPolicy",
+  "openCodeGoProtocol",
+  "openCodeGoManaged",
 ]);
 
 // Some providers deliberately publish opaque preview ids while documenting a
@@ -125,7 +130,7 @@ export function defaultUserModelDescription(providerId) {
   return `User-curated ${providerId} model; conservative default metadata that can be edited in the user model file.`;
 }
 
-export function userModelEntry({ providerId, upstreamId, requestProfile, priority, metadata }) {
+export function userModelEntry({ providerId, upstreamId, requestProfile, reasoningTagPolicy, priority, metadata }) {
   const identity = userModelIdentity({ providerId, upstreamId, metadata });
   const entry = {
     ...identity,
@@ -144,6 +149,7 @@ export function userModelEntry({ providerId, upstreamId, requestProfile, priorit
     if (METADATA_FIELDS.has(key)) entry[key] = value;
   }
   if (requestProfile) entry.requestProfile = requestProfile;
+  if (reasoningTagPolicy !== undefined) entry.reasoningTagPolicy = reasoningTagPolicy;
   return entry;
 }
 
@@ -167,6 +173,7 @@ export function userModelEntryFromCatalog({
     providerId,
     upstreamId: catalogModel.id,
     requestProfile: catalogModel.requestProfile || VERTEX_ADAPTERS[catalogModel.adapter].requestProfile,
+    reasoningTagPolicy: catalogModel.reasoningTagPolicy,
     priority: catalogModel.priority,
     metadata: catalogModel.capabilities,
   });

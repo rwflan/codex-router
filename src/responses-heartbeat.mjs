@@ -13,8 +13,9 @@ import { Transform } from "node:stream";
 //
 // It never authors content. It repeats only the identity of the response the
 // stream itself announced, only at an SSE event boundary, only after the client
-// has seen `response.created`, and never after a terminal event. It is the
-// last stage before the client, so no router transform ever parses it.
+// has seen `response.created`, and never after a terminal event. It runs
+// after the content rewrites; only the final bounded failure-metadata observer
+// follows it, preserving the heartbeat's bytes.
 const TERMINAL_EVENT_TYPES = new Set([
   "response.completed",
   "response.failed",
@@ -72,9 +73,10 @@ export class ResponsesHeartbeatTransform extends Transform {
       const blocks = this.#parseBuffer.split(/\r?\n\r?\n/);
       this.#parseBuffer = blocks.pop() || "";
       for (const block of blocks) this.#observe(block);
-      if (this.#parseBuffer.length > MAX_SNAPSHOT_EVENT_CHARS && !this.#identity) {
-        // An unbounded partial event before any announcement: stop trying.
-        this.#terminal = true;
+      if (this.#parseBuffer.length > MAX_SNAPSHOT_EVENT_CHARS) {
+        // Identity does not justify retaining an unbounded partial event.
+        this.#parseBuffer = "";
+        this.#stop();
       }
       this.#arm();
     }

@@ -386,8 +386,20 @@ struct ModelRouterTrayApp: App {
     // MenuBarExtra(.window) re-anchors from a SwiftUI-driven status item on
     // every RouterStore publish, which parks the panel on opposite screen
     // corners. The AppDelegate owns one fixed NSStatusItem and NSPanel instead.
-    // This empty Settings scene is only here to satisfy App.
-    Settings { EmptyView() }
+    // App still needs one scene. An empty Settings scene used to fill that
+    // role, but macOS 26 opens a lone Settings scene at launch, so every login
+    // put a blank "Codex Router Settings" window on screen. A MenuBarExtra that
+    // is never inserted satisfies App without owning a window. Settings...
+    // (Command-comma) opens the Control Center on its Settings page.
+    MenuBarExtra("Codex Router", isInserted: .constant(false)) { EmptyView() }
+      .commands {
+        CommandGroup(replacing: .appSettings) {
+          Button(routerLocalized("Settings") + "…") {
+            ControlCenterLauncher.open(navigation: ControlCenterNavigationRequest(destination: .settings))
+          }
+          .keyboardShortcut(",")
+        }
+      }
   }
 }
 
@@ -707,6 +719,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private var widgetSnapshotPublishing: AnyCancellable?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
+    ControlCenterLauncher.logLaunchEvent("host-finished-launching")
     NSApp.setActivationPolicy(.accessory)
     trayMenuController = TrayMenuController(store: store)
     islandController = IslandWindowController(store: store)
@@ -752,6 +765,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   // handling it the second open is silently swallowed and the app reads as
   // broken.
   func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+    ControlCenterLauncher.logLaunchEvent("host-reopen-received")
     store.revealForUserLaunch()
     ControlCenterLauncher.open()
     return true
@@ -785,6 +799,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 enum ControlCenterDestination: String, Equatable {
   case usage
   case usageResets = "usage-resets"
+  case settings
 
 }
 
@@ -795,6 +810,15 @@ struct ControlCenterNavigationRequest: Equatable {
 
   let destination: ControlCenterDestination
   let sourceID: String?
+
+  // The tray's own Settings item asks for its page directly. Widget and other
+  // external URLs still arrive through `init?(url:)`, which accepts only the
+  // usage destinations, so a registered `codex-router://` link cannot open the
+  // Settings page.
+  init(destination: ControlCenterDestination) {
+    self.destination = destination
+    sourceID = nil
+  }
 
   init?(url: URL) {
     guard url.scheme == Self.scheme,
@@ -851,8 +875,13 @@ enum ControlCenterLauncher {
     return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
   }
 
+  nonisolated static func logLaunchEvent(_ event: String) {
+    FileHandle.standardError.write(Data("codex-router-control-center: \(event)\n".utf8))
+  }
+
   static func open(navigation: ControlCenterNavigationRequest? = nil) {
     guard let application = bundledApplicationURL else {
+      logLaunchEvent("embedded-bundle-missing")
       RouterStore.shared.reportControlCenterLaunchFailure(
         routerLocalized("The embedded Control Center is missing. Rebuild Codex Router.")
       )
@@ -863,6 +892,7 @@ enum ControlCenterLauncher {
         try await retireSupersededControlCenters(except: application)
         openBundledApplication(application, navigation: navigation)
       } catch {
+        logLaunchEvent("superseded-instance-retirement-failed")
         RouterStore.shared.reportControlCenterLaunchFailure(error.localizedDescription)
       }
     }
@@ -902,8 +932,13 @@ enum ControlCenterLauncher {
     let configuration = NSWorkspace.OpenConfiguration()
     configuration.activates = true
     configuration.environment = embeddedEnvironment(processEnvironment: ProcessInfo.processInfo.environment)
-    let completion: @Sendable (NSRunningApplication?, (any Error)?) -> Void = { _, error in
-      guard let error else { return }
+    logLaunchEvent("embedded-open-requested")
+    let completion: @Sendable (NSRunningApplication?, (any Error)?) -> Void = { application, error in
+      guard let error else {
+        logLaunchEvent(application == nil ? "embedded-open-no-application" : "embedded-open-accepted")
+        return
+      }
+      logLaunchEvent("embedded-open-failed code=\((error as NSError).code)")
       let message = error.localizedDescription
       Task { @MainActor in
         RouterStore.shared.reportControlCenterLaunchFailure(
@@ -1624,6 +1659,7 @@ final class RouterStore: ObservableObject {
     "orca": "OrcaRouter",
     "venice": "Venice",
     "nousresearch": "Nous",
+    "aimlapi": "AI/ML API",
     "openrouter": "OpenRouter",
   ]
 
@@ -10553,23 +10589,21 @@ func usageResetCaption(_ date: Date) -> String {
 // How long until a quota window reopens -- the number people actually scan
 // the reset list for. The absolute clock time is resetClockLabel's job.
 // Explicit language makes tests deterministic while other suites change the
-// process preference. The optional Bool preserves existing caller compatibility.
+// process preference.
 func resetCountdownLabel(
   _ date: Date,
   now: Date = Date(),
-  chinese: Bool? = nil,
   language: ResolvedTrayLanguage = RouterLanguage.resolution
 ) -> String {
-  let resolved = chinese.map { $0 ? ResolvedTrayLanguage.chinese : .english } ?? language
   let seconds = date.timeIntervalSince(now)
-  if seconds <= 0 { return routerMessage(.resetSoon, language: resolved) }
+  if seconds <= 0 { return routerMessage(.resetSoon, language: language) }
   let minutes = Int(seconds / 60)
-  if minutes < 60 { return routerMessage(.resetMinutes, ["minutes": "\(minutes)"], language: resolved) }
+  if minutes < 60 { return routerMessage(.resetMinutes, ["minutes": "\(minutes)"], language: language) }
   let hours = minutes / 60
   if hours < 24 {
-    return routerMessage(.resetHours, ["hours": "\(hours)", "minutes": "\(minutes % 60)"], language: resolved)
+    return routerMessage(.resetHours, ["hours": "\(hours)", "minutes": "\(minutes % 60)"], language: language)
   }
-  return routerMessage(.resetDays, ["days": "\(hours / 24)", "hours": "\(hours % 24)"], language: resolved)
+  return routerMessage(.resetDays, ["days": "\(hours / 24)", "hours": "\(hours % 24)"], language: language)
 }
 
 // Just enough calendar context for the countdown: time today, weekday inside

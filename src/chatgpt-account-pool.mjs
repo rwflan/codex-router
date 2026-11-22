@@ -3,7 +3,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 
-import lockfile from "proper-lockfile";
+import { acquireFileLock, runWithLockRelease } from "./file-lock.mjs";
 
 import { privateFileIsProtected, protectPrivateFile, writePrivateJson } from "./file-security.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
@@ -97,7 +97,9 @@ function normalizePolicy(raw = {}) {
 function normalizeIdentity(raw) {
   const value = text(raw?.accountId);
   if (!value || value.length > 256 || /[\u0000-\u001f\u007f]/.test(value)) return undefined;
-  return { accountId: value, ...(text(raw.email) ? { email: text(raw.email).slice(0, 320) } : {}) };
+  const userId = text(raw.userId);
+  if (raw.userId !== undefined && (!userId || userId.length > 256 || /[\u0000-\u001f\u007f]/.test(userId))) return undefined;
+  return { accountId: value, ...(userId ? { userId } : {}), ...(text(raw.email) ? { email: text(raw.email).slice(0, 320) } : {}) };
 }
 function normalizeHealth(raw) {
   const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
@@ -700,9 +702,6 @@ export async function withChatGPTAccountPoolLock(operation, { filePath = CHATGPT
   const lockPath = `${lockTarget}.lock`;
   const retries = Math.max(0, Math.ceil(waitMs / retryMs) - 1);
   mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  let release;
-  try {
-    release = await lockfile.lock(lockTarget, { realpath: false, lockfilePath: lockPath, stale: Math.max(2_000, staleMs), retries: { retries, factor: 1, minTimeout: retryMs, maxTimeout: retryMs, randomize: false } });
-    return await operation();
-  } finally { if (release) await release().catch(() => {}); }
+  const release = await acquireFileLock(lockTarget, { realpath: false, lockfilePath: lockPath, stale: Math.max(2_000, staleMs), retries: { retries, factor: 1, minTimeout: retryMs, maxTimeout: retryMs, randomize: false } });
+  return runWithLockRelease(operation, release);
 }

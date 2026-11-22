@@ -11,7 +11,7 @@
 // every other byte as somebody else's work. Anything it cannot read plainly is
 // refused with the file untouched.
 
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -25,7 +25,7 @@ import {
   PORTS,
   LEGACY_PORTS,
 } from "./paths.mjs";
-import { protectPrivateFile } from "./file-security.mjs";
+import { writePrivateFile } from "./file-security.mjs";
 import { refreshDshCallerCapabilityDocuments } from "./caller-key-client-refresh.mjs";
 import {
   DSH_CREDENTIAL_REF,
@@ -66,18 +66,7 @@ function readDocument(target) {
 // authentication capability, and the credentials document carries the key it
 // references.
 function writeDocument(target, contents) {
-  mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  const temporary = `${target}.tmp.${process.pid}`;
-  writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
-  try {
-    protectPrivateFile(temporary);
-    renameSync(temporary, target);
-    protectPrivateFile(target);
-  } catch (error) {
-    if (existsSync(temporary)) unlinkSync(temporary);
-    throw error;
-  }
-  return target;
+  return writePrivateFile(target, contents);
 }
 
 function joinLines(lines) {
@@ -182,6 +171,9 @@ export function removeRouteFromSettings(contents) {
 //
 const CREDENTIAL_REFS_KEY = "refs";
 const CREDENTIAL_VERSION_KEY = "version";
+// The envelope's third section: the harness's own tagged records (a stored
+// browser session, for one). Nested by design and never edited here.
+const CREDENTIAL_RECORDS_KEY = "records";
 
 /**
  * Decides which of the two shapes a credentials document is written in.
@@ -223,8 +215,11 @@ function credentialPath(document, reference) {
 // and rewriting it would be a guess. The envelope adds one legal level of
 // nesting and not one byte more, so its own entries are held to the same rule —
 // a `refs:` holding `server:\n  host: …` is somebody's configuration file, not
-// a reference map, however much the top of it matches.
-function assertCredentialDocument(document, refs) {
+// a reference map, however much the top of it matches. The one exception is
+// the envelope's own `records` section: refusing it blocked every client
+// publication as soon as the harness stored a browser session. A root-level map
+// has no such section, so there it is still a nested mapping.
+function assertCredentialDocument(document, refs, wrapped) {
   const nested = (owner) => {
     throw new Error(
       `Refusing to edit the harness credentials document: "${owner}" holds a nested mapping, ` +
@@ -238,8 +233,18 @@ function assertCredentialDocument(document, refs) {
       }
       continue;
     }
+    if (node.key === CREDENTIAL_RECORDS_KEY) {
+      if (!wrapped && node.children.size) nested(node.key);
+      continue;
+    }
     if (node.children.size) nested(node.key);
   }
+}
+
+// Read the harness's scope/id and JSON payload keys without skipping lexical
+// or duplicate-key validation. Publication never splices inside records.
+function scanCredentials(contents) {
+  return scanYamlDocument(contents, { extendedPlainKeyRoots: [CREDENTIAL_RECORDS_KEY] });
 }
 
 function withoutNode(document, node) {
@@ -257,9 +262,9 @@ function withoutNode(document, node) {
  * mapping inside `refs`, an inline `refs` — is refused with the file untouched.
  */
 export function applyCredential(contents, reference, value) {
-  const initial = scanYamlDocument(contents);
+  const initial = scanCredentials(contents);
   const { wrapped } = credentialEnvelope(initial);
-  assertCredentialDocument(initial, initial.root.children.get(CREDENTIAL_REFS_KEY));
+  assertCredentialDocument(initial, initial.root.children.get(CREDENTIAL_REFS_KEY), wrapped);
 
   // A build of this router from before the envelope was understood wrote our
   // own reference at the root of a document the harness reads through `refs`.
@@ -268,7 +273,7 @@ export function applyCredential(contents, reference, value) {
   // that era would find again. Take it out; nothing else is touched.
   const misplaced = wrapped ? yamlNode(initial, [reference]) : undefined;
   const document = misplaced
-    ? scanYamlDocument(withoutNode(initial, misplaced).join("\n"))
+    ? scanCredentials(withoutNode(initial, misplaced).join("\n"))
     : initial;
 
   const refs = wrapped ? document.root.children.get(CREDENTIAL_REFS_KEY) : undefined;
@@ -303,7 +308,7 @@ export function applyCredential(contents, reference, value) {
 export function removeCredential(contents, reference) {
   let text = String(contents ?? "");
   for (;;) {
-    const document = scanYamlDocument(text);
+    const document = scanCredentials(text);
     const node =
       yamlNode(document, [CREDENTIAL_REFS_KEY, reference]) || yamlNode(document, [reference]);
     if (!node) return joinLines(normalizeTrailing(document.lines));
@@ -343,42 +348,41 @@ function defaultModelSnapshotPath() {
 // reversible: the previous section is snapshotted verbatim and put back on
 // uninstall. This mirrors how the Codex login-free mode treats `model` and
 // `model_provider` rather than inventing a second discipline.
+function readDefaultModelSnapshot() {
+  const target = defaultModelSnapshotPath();
+  if (!existsSync(target)) return undefined;
+  let snapshot;
+  try { snapshot = JSON.parse(readFileSync(target, "utf8")); } catch {
+    throw new Error("The DSH default-model snapshot is unreadable; refusing to discard it.");
+  }
+  if (snapshot?.version !== 1 || !(snapshot.previous === null ||
+    (Array.isArray(snapshot.previous) && snapshot.previous.every((line) => typeof line === "string")))) {
+    throw new Error("The DSH default-model snapshot is invalid; refusing to discard it.");
+  }
+  return snapshot;
+}
+
+function routerOwnsDefault(document, node) {
+  return Boolean(node && document.lines.slice(node.index, node.endIndex + 1)
+    .some((line) => new RegExp(`^\\s*provider:\\s*['"]?${DSH_ROUTE_ID}['"]?\\s*$`).test(line)));
+}
+
 function snapshotDefaultModel(contents) {
   const document = scanYamlDocument(contents);
   const node = yamlNode(document, DEFAULT_MODEL_PATH);
-  const previous = node
-    ? document.lines.slice(node.index, node.endIndex + 1)
-    : null;
-  writeDocument(
-    defaultModelSnapshotPath(),
-    `${JSON.stringify({ version: 1, previous }, null, 2)}\n`,
-  );
+  const snapshot = readDefaultModelSnapshot();
+  // Repeated publication is still the same ownership period. Capturing our
+  // own default here would replace the only copy of the user's selection.
+  if (snapshot && routerOwnsDefault(document, node)) return;
+  const previous = node ? document.lines.slice(node.index, node.endIndex + 1) : null;
+  writeDocument(defaultModelSnapshotPath(), `${JSON.stringify({ version: 1, previous }, null, 2)}\n`);
 }
 
 function restoreDefaultModel(contents) {
-  const target = defaultModelSnapshotPath();
   const document = scanYamlDocument(contents);
   const node = yamlNode(document, DEFAULT_MODEL_PATH);
-  // Whether the default currently in the document is one this router wrote.
-  // Between a snapshot and now the user may have chosen their own -- the
-  // harness's own Models page writes the same key -- and putting a snapshot
-  // back over that is not a restore, it is discarding a later choice.
-  const routerOwnsCurrent = Boolean(
-    node &&
-      document.lines
-        .slice(node.index, node.endIndex + 1)
-        .some((line) => new RegExp(`^\\s*provider:\\s*['"]?${DSH_ROUTE_ID}['"]?\\s*$`).test(line)),
-  );
-
-  let previous;
-  if (existsSync(target)) {
-    try {
-      previous = JSON.parse(readFileSync(target, "utf8")).previous;
-    } catch {
-      previous = undefined;
-    }
-    unlinkSync(target);
-  }
+  const routerOwnsCurrent = routerOwnsDefault(document, node);
+  const previous = readDefaultModelSnapshot()?.previous;
 
   // Somebody else's choice, or no default at all: nothing here belongs to this
   // router, so nothing is touched.
@@ -480,6 +484,8 @@ export function uninstall() {
     );
   }
   if (existsSync(DSH_CATALOG_PATH)) unlinkSync(DSH_CATALOG_PATH);
+  const snapshotPath = defaultModelSnapshotPath();
+  if (existsSync(snapshotPath)) unlinkSync(snapshotPath);
   return {
     settings: DSH_SETTINGS_PATH,
     credentials: DSH_CREDENTIALS_PATH,
@@ -563,7 +569,7 @@ export function status() {
     // an enveloped document is present on disk and absent to the harness, and
     // reporting that as installed turns a missing credential into a 401 with
     // no diagnostic anywhere.
-    const document = scanYamlDocument(credentials);
+    const document = scanCredentials(credentials);
     credentialPresent = Boolean(yamlNode(document, credentialPath(document, DSH_CREDENTIAL_REF)));
   } catch {
     credentialPresent = false;

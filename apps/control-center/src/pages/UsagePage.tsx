@@ -16,6 +16,7 @@ import {
   formatDateTime,
   metricValue,
   remainingPercent,
+  tokenCountFromEvent,
   type AccountBucketSource,
 } from "../lib";
 import type {
@@ -30,6 +31,7 @@ import type {
   UsageMetric,
 } from "../types";
 import { useI18n } from "../i18n-react";
+import { FreePoolPanel } from "./FreePoolPanel";
 import { translatorLocale, type Translate } from "../i18n";
 import "./usage-status.css";
 
@@ -471,6 +473,7 @@ export function UsagePage({
           </div>
         </>
       )}
+      <FreePoolPanel api={api} refreshKey={refreshing} t={t} />
     </div>
   );
 }
@@ -1429,8 +1432,8 @@ function rollingEventTotals(events: UsageEvent[] | undefined, now = Date.now()):
     requests += 1;
     const input = optionalEventNumber(event.billedInputTokens ?? event.inputTokens);
     const output = optionalEventNumber(event.billedOutputTokens ?? event.outputTokens);
-    const explicitTotal = optionalEventNumber(event.totalTokens);
-    if (input === null && output === null && explicitTotal === null) continue;
+    const total = tokenCountFromEvent(event);
+    if (input === null && output === null && total === null) continue;
     meteredRequests += 1;
     measured = true;
     const inputValue = input ?? 0;
@@ -1442,7 +1445,7 @@ function rollingEventTotals(events: UsageEvent[] | undefined, now = Date.now()):
     regularInputTokens += Math.max(0, inputValue - cachedValue);
     cachedInputTokens += cachedValue;
     outputTokens += output ?? 0;
-    tokens += explicitTotal ?? inputValue + (output ?? 0);
+    tokens += Math.round(total ?? inputValue + (output ?? 0));
     if (cached !== null) cacheTelemetry = true;
   }
   return {

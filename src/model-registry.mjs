@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readCompatibilityLayerSettings, requiresCompatibilityLayer } from "./compatibility-layer-state.mjs";
 import path from "node:path";
 import { usesDeepSeekResponses } from "./deepseek-responses.mjs";
 
@@ -17,8 +18,10 @@ import {
 } from "./opencode-curation.mjs";
 import { instructionOverlayExists } from "./instruction-overlays.mjs";
 import { SOURCE_ROOT } from "./paths.mjs";
+import { FREE_POOL_PROVIDER, FREE_POOL_SLUG, freePoolMemberModels } from "./free-pool-catalog.mjs";
 import { officialModelDisplayName, readUserModels } from "./user-models.mjs";
 import { curatableRequestProfile, requestProfileKnown } from "./request-profiles.mjs";
+import { reasoningTagPolicyProblem } from "./reasoning-tag-policy.mjs";
 import { VERTEX_ADAPTERS } from "./vertex-adapters.mjs";
 
 export const REGISTRY_PATH =
@@ -35,9 +38,12 @@ function fail(message) {
 // future registry entry cannot turn an arbitrary HTTPS endpoint into a
 // credential-free exfiltration path.
 const ANONYMOUS_ENDPOINTS = Object.freeze({
-  "opencode-free": "https://opencode.ai/zen/v1",
-  "opencode-free-responses": "https://opencode.ai/zen/v1",
+  "opencode-free": "https://opencode.ai/inference/v1",
+  "opencode-free-responses": "https://opencode.ai/inference/v1",
   "kilo-free": "https://api.kilo.ai/api/gateway",
+  // The free/auto pool: the same two free lanes, under one picker entry.
+  free: "https://api.kilo.ai/api/gateway",
+  "free-opencode": "https://opencode.ai/inference/v1",
 });
 
 // The same guarantee, one level down. A per-model endpoint moves the address
@@ -58,6 +64,12 @@ export function anonymousModelAllowed(provider, modelId) {
     return id === "big-pickle" || id.endsWith("-free");
   }
   if (provider.anonymousModelPolicy === "suffix-free") return id.endsWith(":free");
+  // Kilo names some of its free pool without the `:free` suffix
+  // (`reflection/beam-free`, `openrouter/free`, `kilo-auto/free`); every one of
+  // them still says free in its id, which is what keeps this an allowlist.
+  if (provider.anonymousModelPolicy === "free-pool") {
+    return id.endsWith(":free") || id.endsWith("/free") || id.endsWith("-free");
+  }
   if (provider.anonymousModelPolicy === "explicit-models") {
     return Array.isArray(provider.anonymousModels) && provider.anonymousModels.includes(id);
   }
@@ -293,6 +305,7 @@ function loadRegistry() {
         }
         if (![
           "explicit-models",
+          "free-pool",
           "opencode-console",
           "suffix-free",
         ].includes(provider.anonymousModelPolicy)) {
@@ -496,6 +509,12 @@ function endpointProblem(model, provider) {
   if (!/^https?:\/\//.test(endpoint.baseUrl || "")) {
     return `model ${model.slug} endpoint requires an HTTP(S) baseUrl`;
   }
+  if (
+    endpoint.protocol !== undefined &&
+    !["openai", "anthropic", "openai-responses"].includes(endpoint.protocol)
+  ) {
+    return `model ${model.slug} endpoint has an unsupported API protocol`;
+  }
   if (endpoint.authMode !== undefined && endpoint.authMode !== "anonymous") {
     return `model ${model.slug} endpoint has an unsupported authMode`;
   }
@@ -626,6 +645,21 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   if (!model.slug.startsWith(`${model.provider}/`)) {
     return `model ${model.slug} must be namespaced under ${model.provider}/`;
   }
+  const goProtocolProviders = {
+    "chat-completions": "opencode-go",
+    messages: "opencode-go-messages",
+    responses: "opencode-go-responses",
+    "generate-content": "opencode-go",
+  };
+  if (model.openCodeGoProtocol !== undefined &&
+    goProtocolProviders[model.openCodeGoProtocol] !== model.provider) {
+    return `model ${model.slug} has an invalid OpenCode Go protocol`;
+  }
+  if (model.openCodeGoManaged !== undefined &&
+    (typeof model.openCodeGoManaged !== "boolean" ||
+      !model.provider.startsWith("opencode-go"))) {
+    return `model ${model.slug} has an invalid OpenCode Go management flag`;
+  }
   if (model.adapter !== undefined && typeof model.adapter !== "string") {
     return "model " + model.slug + " has an invalid adapter";
   }
@@ -664,6 +698,11 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   if (model.requestProfile !== undefined && !requestProfileKnown(model.requestProfile)) {
     return `model ${model.slug} has an invalid requestProfile`;
   }
+  const tagPolicyProblem = reasoningTagPolicyProblem(model);
+  if (tagPolicyProblem) return `model ${model.slug} ${tagPolicyProblem}`;
+  if (model.goalContinuationGuard !== undefined && typeof model.goalContinuationGuard !== "boolean") {
+    return `model ${model.slug} has an invalid goalContinuationGuard flag`;
+  }
   if (model.supportedEndpoints !== undefined) {
     let supported;
     try {
@@ -673,9 +712,12 @@ function modelProblem(model, providers, slugs, gatewayModels) {
     } catch (error) {
       return error instanceof Error ? error.message : String(error);
     }
-    const conversational = providerModelEndpoint(provider);
+    const protocolProvider = provider.perModelEndpoint
+      ? { ...provider, protocol: model.endpoint?.protocol ?? "openai" }
+      : provider;
+    const conversational = providerModelEndpoint(protocolProvider);
     if (!conversational && supported.includes("/embeddings")) {
-      return `model ${model.slug} cannot declare OpenAI endpoints for provider protocol ${provider.protocol}`;
+      return `model ${model.slug} cannot declare OpenAI endpoints for provider protocol ${protocolProvider.protocol}`;
     }
     if (model.listed && (!conversational || !supported.includes(conversational))) {
       return `listed model ${model.slug} must support its provider's conversational endpoint`;
@@ -806,6 +848,9 @@ function modelProblem(model, providers, slugs, gatewayModels) {
       return `model ${model.slug} has duplicate serviceTiers`;
     }
   }
+  if (model.repetitionGuard !== undefined && typeof model.repetitionGuard !== "boolean") {
+    return `model ${model.slug} has an invalid repetitionGuard flag`;
+  }
   if (
     model.defaultReasoningSummary !== undefined &&
     !["auto", "concise", "detailed"].includes(model.defaultReasoningSummary)
@@ -844,6 +889,17 @@ function modelProblem(model, providers, slugs, gatewayModels) {
     ) {
       return `model ${model.slug} has an invalid upgradeTo`;
     }
+  }
+  // Only an explicit boolean may change failover eligibility; anything else is
+  // a typo that would otherwise silently leave the route eligible.
+  if (
+    model.freePool !== undefined &&
+    (model.freePool !== true || model.slug !== FREE_POOL_SLUG || model.provider !== FREE_POOL_PROVIDER)
+  ) {
+    return `model ${model.slug} may not declare freePool; only ${FREE_POOL_SLUG} is the free pool`;
+  }
+  if (model.failoverCandidate !== undefined && typeof model.failoverCandidate !== "boolean") {
+    return `model ${model.slug} has an invalid failoverCandidate`;
   }
   if (slugs.has(model.slug)) return `duplicate model slug ${model.slug}`;
   if (gatewayModels.has(model.gatewayModel)) {
@@ -948,13 +1004,13 @@ function mergeUserModels(base, staticAliases) {
   const models = [...base.models];
   const slugs = new Set(models.map((model) => model.slug));
   const gatewayModels = new Set(models.map((model) => model.gatewayModel));
-  // Curation used to publish opaque provider ids before a checked-in entry
-  // gave the same route a stable public slug. Treat provider + upstream id as
-  // routing identity too, not only the public slug: otherwise both names reach
-  // the exact same endpoint and the picker shows a duplicate model. Keep the
-  // replacement so persisted visibility can follow the canonical slug.
+  // Provider-level routes share one endpoint, so an old curation slug for a
+  // checked-in model can follow its canonical slug. Per-model endpoints are
+  // explicit destinations: the same upstream id does not make them aliases.
   const checkedInRoutes = new Map(
-    models.map((model) => [`${model.provider}\0${model.upstreamModel}`, model]),
+    models
+      .filter((model) => !base.providers.get(model.provider)?.perModelEndpoint)
+      .map((model) => [`${model.provider}\0${model.upstreamModel}`, model]),
   );
   const aliases = new Map();
   const userModels = new Set();
@@ -1066,7 +1122,38 @@ export const RUNTIME_PROVIDER_WARNINGS = runtime.warnings;
 // bind to this set: a local overlay is useful routing configuration, but it
 // cannot certify itself for every installer.
 export const CHECKED_IN_MODELS = registry.models;
-export const MODELS = merged.models;
+export const COMPATIBILITY_LAYER = Object.freeze(readCompatibilityLayerSettings());
+export const COMPATIBILITY_DISABLED_MODELS = new Map();
+// The free/auto pool's members are ordinary unlisted routes built from the
+// cached free catalogs (src/free-pool-catalog.mjs). They are added here, after
+// the checked-in and user models, so CHECKED_IN_MODELS stays exactly what the
+// checkout ships and a member can never shadow a real route: one that fails
+// validation or collides is dropped, never the route it collided with.
+export const FREE_POOL_MEMBER_WARNINGS = [];
+function withFreePoolMembers(models) {
+  if (!models.some((model) => model.slug === FREE_POOL_SLUG)) return models;
+  const slugs = new Set(models.map((model) => model.slug));
+  const gatewayModels = new Set(models.map((model) => model.gatewayModel));
+  const members = [];
+  for (const candidate of freePoolMemberModels()) {
+    if (slugs.has(candidate.slug) || gatewayModels.has(candidate.gatewayModel)) continue;
+    const problem = modelProblem(candidate, runtime.providers, slugs, gatewayModels);
+    if (problem) {
+      FREE_POOL_MEMBER_WARNINGS.push(problem);
+      continue;
+    }
+    slugs.add(candidate.slug);
+    gatewayModels.add(candidate.gatewayModel);
+    members.push(Object.freeze(normalizedModel(candidate, runtime.providers.get(candidate.provider))));
+  }
+  return [...models, ...members];
+}
+export const MODELS = Object.freeze(withFreePoolMembers(merged.models).filter((model) => {
+  if (COMPATIBILITY_LAYER.enabled || !requiresCompatibilityLayer(model, providerForModel)) return true;
+  COMPATIBILITY_DISABLED_MODELS.set(model.slug, model);
+  COMPATIBILITY_DISABLED_MODELS.set(model.gatewayModel, model);
+  return false;
+}));
 // Slugs of the locally curated models in MODELS -- the `user-models.json`
 // overlay entries that survived the merge. A desktop surface offers removal
 // only for these, because curation removal prunes the overlay and can never
@@ -1083,6 +1170,11 @@ export const MODEL_SLUG_ALIASES = new Map([
   ...staticAliases,
   ...merged.aliases,
 ]);
+for (const [from, to] of MODEL_SLUG_ALIASES) {
+  if (COMPATIBILITY_DISABLED_MODELS.has(to)) {
+    COMPATIBILITY_DISABLED_MODELS.set(from, COMPATIBILITY_DISABLED_MODELS.get(to));
+  }
+}
 export const LISTED_MODELS = Object.freeze(MODELS.filter((model) => model.listed));
 export const API_MODELS = Object.freeze(
   MODELS.filter((model) => RUNTIME_PROVIDERS.get(model.provider)?.kind === "openai-compatible"),
@@ -1098,6 +1190,12 @@ export const MODEL_BY_GATEWAY_ID = new Map(
 
 export function providerForModel(model) {
   const provider = RUNTIME_PROVIDERS.get(model.provider);
+  // The container keeps provider identity and selection; the model owns its
+  // protocol, address and credential. Do not copy endpoint identity or auth
+  // into this descriptor, which consumers still use as the provider.
+  if (provider?.perModelEndpoint) {
+    return { ...provider, protocol: model.endpoint?.protocol ?? "openai" };
+  }
   // One credential/provider identity can serve both its legacy Chat aliases
   // and the current direct Flash model's native Responses contract.
   return usesDeepSeekResponses(model) && provider

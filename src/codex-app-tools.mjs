@@ -1189,6 +1189,15 @@ export function splitFlatCodexAppName(name) {
 // provider should still see them.
 export function mergeCodexAppTools(tools) {
   if (!Array.isArray(tools)) return { tools, merged: false };
+  // Current Desktop clients register app tools as MCP tools. That registry
+  // owns dispatch and schemas; the legacy native snapshot is not executable
+  // under its old identities merely because the operations have similar names.
+  const modernAppRegistration = tools.some((tool) =>
+    tool?.type === "namespace" ? tool.name === "mcp__codex_app" :
+      tool?.type === "function" && (tool.namespace === "mcp__codex_app" ||
+        (typeof (tool.name ?? tool.function?.name) === "string" &&
+          (tool.name ?? tool.function?.name).startsWith("mcp__codex_app__"))));
+  if (modernAppRegistration) return { tools, merged: false };
   const namespaces = new Map();
   for (const entry of CODEX_APP_TOOLS) {
     if (entry?.type !== "namespace") continue;
@@ -1210,7 +1219,24 @@ export function mergeCodexAppTools(tools) {
       const clientTools = [];
       for (const fn of Array.isArray(tool.tools) ? tool.tools : []) {
         if (!fn?.name) continue;
-        clientTools.push(fn);
+        // The client marks its app registrations `defer_loading` and expects
+        // a search to return them. This snapshot is the router's own relay of
+        // the same surface -- the app executes these calls natively whether or
+        // not they were declared -- so a deferral marker on a tool the router
+        // vouches for would hide it behind a search the router does not serve.
+        if (full.has(fn.name) && fn.defer_loading !== undefined) {
+          const { defer_loading: _deferLoading, ...eager } = fn;
+          clientTools.push(eager);
+          changed = true;
+        } else if (!full.has(fn.name) && tool.defer_loading === true &&
+          (fn.type === undefined || fn.type === "function") && fn.defer_loading !== true) {
+          // Removing the namespace marker makes the known snapshot eager,
+          // but unknown client functions still inherit its deferral contract.
+          clientTools.push({ ...fn, defer_loading: true });
+          changed = true;
+        } else {
+          clientTools.push(fn);
+        }
         seen.add(fn.name);
       }
       const missing = [...full.values()].filter((fn) => !seen.has(fn.name));
@@ -1218,7 +1244,11 @@ export function mergeCodexAppTools(tools) {
         clientTools.push(...missing);
         changed = true;
       }
-      merged.push({ ...tool, tools: clientTools });
+      // Same reason at namespace scope: a deferred namespace would withhold
+      // every definition inside it, including the ones injected just above.
+      const { defer_loading: _namespaceDeferred, ...eagerNamespace } = tool;
+      if (tool.defer_loading !== undefined) changed = true;
+      merged.push({ ...eagerNamespace, tools: clientTools });
       seenNamespaces.add(tool.name);
       continue;
     }
