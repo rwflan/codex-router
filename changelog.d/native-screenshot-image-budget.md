@@ -1,0 +1,1 @@
+- **Computer-use turns no longer fail on oversized screenshot history.** Native Codex requests keep their screenshots under the backend's observed size limit, drop repeated identical captures within one tool result, and retry an image rejection with fewer older images. The newest screenshot is always kept.

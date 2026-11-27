@@ -289,6 +289,14 @@ function run(command, args, extraEnv = {}) {
     // diagnostic subprocesses, and restarted children keep normal runtime bounds.
     env: runtimeChildEnvironment({ ...process.env, ...commonEnv, ...extraEnv }),
     stdio: "inherit",
+    // The service is normally started hidden (service-windows.mjs launches it
+    // through a hidden wscript/cmd pair), but a console child spawned by a
+    // parent with no console allocates a window of its own. That is what put a
+    // visible LiteLLM terminal on the desktop, and because the gateway
+    // supervisor restarts the child when the window is closed, closing it
+    // brought a fresh window back every time. CREATE_NO_WINDOW keeps the whole
+    // tree headless no matter how the supervisor was started.
+    windowsHide: true,
     ...spawnable.options,
   });
   // Observe from spawn time, before health checks or later teardown await the
