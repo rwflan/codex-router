@@ -984,13 +984,13 @@ class ResponsesWebSocketPeer {
         });
         return;
       }
+      // Repeated screenshots matter once they are replayed as history; the
+      // turn being sent now goes through exactly as the client wrote it.
       fullRequest.input = [
-        ...previous.input,
-        ...previous.output,
+        ...dedupeToolOutputImages([...previous.input, ...previous.output]),
         ...request.input,
       ];
     }
-    fullRequest.input = dedupeToolOutputImages(fullRequest.input);
     // Codex's ResponseCreateWsRequest serializes every stable non-input field
     // on incremental frames; only `input` becomes the suffix and
     // `previous_response_id` names its baseline. Keep the current envelope as

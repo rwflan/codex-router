@@ -1552,6 +1552,41 @@ test("custom WebSocket body limits trim consumed image history before encoding",
   peer.close();
 });
 
+test("repeated screenshots in replayed history are sent once", async (t) => {
+  const bodies = [];
+  const shot = { type: "input_image", image_url: `data:image/png;base64,${"B".repeat(64)}`, detail: "original" };
+  const call = { type: "function_call", call_id: "c1", name: "view_image", arguments: "{}" };
+  const { server, port } = await startServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    const id = `resp-dupe-${bodies.length}`;
+    sse(response, [
+      { type: "response.created", response: { id } },
+      ...(bodies.length === 1 ? [{ type: "response.output_item.done", item: call }] : []),
+      { type: "response.completed", response: { id, usage: {} } },
+    ]);
+  });
+  t.after(() => server.close());
+  const { peer } = await connect(port);
+  t.after(() => peer.socket.destroy());
+  const repeated = { type: "function_call_output", call_id: "old", output: [shot, shot] };
+  peer.sendJson(createRequest({ input: [repeated] }));
+  assert.equal((await peer.nextJson()).type, "response.created");
+  assert.equal((await peer.nextJson()).type, "response.output_item.done");
+  assert.equal((await peer.nextJson()).type, "response.completed");
+  // The first request went out as written.
+  assert.equal(bodies[0].input[0].output.length, 2);
+  const fresh = { type: "function_call_output", call_id: "c1", output: [shot, shot] };
+  peer.sendJson(createRequest({ previous_response_id: "resp-dupe-1", input: [fresh] }));
+  assert.equal((await peer.nextJson()).type, "response.created");
+  assert.equal((await peer.nextJson()).type, "response.completed");
+  // Replayed history carries the screenshot once; the new turn is untouched.
+  assert.equal(bodies[1].input[0].output.length, 1);
+  assert.deepEqual(bodies[1].input.at(-1), fresh);
+  peer.close();
+});
+
 test("prewarm obeys a custom continuation cap without making a provider request", async (t) => {
   let calls = 0;
   const { server, port } = await startServer(async (request, response) => {
