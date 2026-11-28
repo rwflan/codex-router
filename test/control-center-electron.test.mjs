@@ -118,6 +118,11 @@ test("ChatGPT browser login reports a terminal retry after child close without a
   const finished = Promise.withResolvers();
   const accountId = "acct_example_123456";
   const attempts = new Map([[accountId, { status: "pending", deadlineAt: Date.now() + 60_000 }]]);
+  // After the browser hand-off the router unrefs the detached login child on
+  // purpose, so nothing keeps this process alive while the test waits for the
+  // child's close. Where the URL arrives before the child's exit is reaped
+  // (seen on Linux), the event loop would drain and cancel the test.
+  const keepAlive = setInterval(() => {}, 1_000);
   try {
     await writeFile(
       executable,
@@ -146,6 +151,7 @@ test("ChatGPT browser login reports a terminal retry after child close without a
       retryable: true,
     });
   } finally {
+    clearInterval(keepAlive);
     await rm(directory, { recursive: true, force: true });
   }
 });
