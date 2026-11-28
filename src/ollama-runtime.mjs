@@ -25,7 +25,7 @@ export const OLLAMA_LOG_PATH =
 
 function commandWorks(command, args = ["--version"], spawn = spawnSync) {
   try {
-    return spawn(command, args, { stdio: "ignore" }).status === 0;
+    return spawn(command, args, { stdio: "ignore", timeout: 1500, windowsHide: true }).status === 0;
   } catch {
     return false;
   }
@@ -65,7 +65,7 @@ export function parseOllamaVersion(output) {
 export function ollamaVersion({ command = ollamaCommand(), spawn = spawnSync } = {}) {
   if (!command) return undefined;
   try {
-    const result = spawn(command, ["--version"], { encoding: "utf8" });
+    const result = spawn(command, ["--version"], { encoding: "utf8", timeout: 1500, windowsHide: true });
     if (result.status !== 0) return undefined;
     return parseOllamaVersion(`${result.stdout || ""}\n${result.stderr || ""}`);
   } catch {
@@ -484,18 +484,18 @@ export async function ensureOllamaHeadless({
     closeSync(logFd);
   }
   child?.unref?.();
-  const ready = await waitForOllama({ baseUrl, fetchImpl, timeoutMs });
-  if (!ready.reachable) {
-    throw new Error(
-      `Ollama was started headlessly but did not become ready${ready.error ? `: ${ready.error}` : "."}`,
-    );
-  }
-  const identity = processIdentity(child?.pid);
-  if (!identity) {
-    child?.kill?.("SIGTERM");
-    throw new Error("Ollama started, but Codex Router could not verify ownership of its process.");
-  }
+  let ready;
   try {
+    ready = await waitForOllama({ baseUrl, fetchImpl, timeoutMs });
+    if (!ready.reachable) {
+      throw new Error(
+        `Ollama was started headlessly but did not become ready${ready.error ? `: ${ready.error}` : "."}`,
+      );
+    }
+    const identity = processIdentity(child?.pid);
+    if (!identity) {
+      throw new Error("Ollama started, but Codex Router could not verify ownership of its process.");
+    }
     writePrivateJson(OLLAMA_RUNTIME_STATE_PATH, {
       version: 1,
       managed: true,
@@ -507,9 +507,7 @@ export async function ensureOllamaHeadless({
       logPath: OLLAMA_LOG_PATH,
     });
   } catch (error) {
-    // A daemon whose ownership record could not be persisted would be
-    // indistinguishable from an external server on shutdown. Do not leave it
-    // behind after reporting startup failure.
+    // Until durable adoption succeeds, this operation owns the spawned child.
     child?.kill?.("SIGTERM");
     throw error;
   }
@@ -527,11 +525,12 @@ export function localOllamaRuntimeSnapshot({
   spawn = spawnSync,
   platform = process.platform,
   baseUrl = process.env.MODEL_ROUTER_LOCAL_BASE_URL || DEFAULT_OLLAMA_BASE_URL,
+  serverReachable,
 } = {}) {
   const command = ollamaCommand({ spawn, platform });
   const state = readOllamaRuntimeState();
   let running = false;
-  if (command) {
+  if (command && serverReachable !== false) {
     const host = ollamaHostForUrl(baseUrl);
     try {
       running = spawn(command, ["list"], {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -21,25 +21,54 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const internalKey = "test-antigravity-internal-key-with-sufficient-length";
 
 async function stopChild(child) {
-  if (child.exitCode !== null) return;
+  if (child.exitCode !== null || child.signalCode !== null) return;
   child.kill("SIGTERM");
   await new Promise((resolve) => child.once("exit", resolve));
 }
 
 async function closeServer(server) {
+  if (!server.listening) return;
   server.closeAllConnections?.();
   await new Promise((resolve) => server.close(resolve));
 }
 
-async function startMockUpstream(handler) {
+async function startMockUpstream(handler, t) {
   const port = await openPort();
   const server = http.createServer(handler);
+  // Setup may throw before its explicit try/finally (for example an ACL write).
+  // Register ownership immediately, so a failed test cannot retain this socket.
+  t.after(() => closeServer(server));
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", resolve);
   });
   return { server, url: `http://127.0.0.1:${port}` };
 }
+
+test("upstream fixture releases its listener when setup throws before finally", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-setup-failure-"));
+  try {
+    const probe = path.join(directory, "setup-failure.test.mjs");
+    writeFileSync(probe, [
+      'import test from "node:test";',
+      'import http from "node:http";',
+      'const openPort = async () => 0;',
+      closeServer.toString(),
+      startMockUpstream.toString(),
+      'test("synthetic setup failure", async (t) => { await startMockUpstream((_request, response) => response.end(), t); throw new Error("synthetic setup rejection"); });',
+    ].join("\n"));
+    // Direct execution runs node:test in this process. A timeout can therefore
+    // retire the entire probe without leaving a separate test worker behind.
+    const result = spawnSync(process.execPath, [probe], {
+      encoding: "utf8", timeout: 10_000, windowsHide: true,
+    });
+    assert.equal(result.error, undefined, "failed setup must not leave an open server until the child timeout");
+    assert.equal(result.status, 1, "the original setup failure must still fail the test");
+    assert.match(result.stdout + result.stderr, /synthetic setup rejection/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 function writeTestToken(directory, { verified = true, overrides = {} } = {}) {
   const tokenPath = path.join(directory, "antigravity-oauth.json");
@@ -74,10 +103,22 @@ function writeTestToken(directory, { verified = true, overrides = {} } = {}) {
   return tokenPath;
 }
 
-function startForwarder(port, upstreamUrl, tokenPath, extraEnv = {}) {
+function startForwarder(port, upstreamUrl, tokenPath, extraEnv = {}, { bodyReadBarrier = false } = {}) {
+  // Observe the real body-reader boundary in the child. A wall-clock delay
+  // after request.write() cannot prove the server has admitted that session.
+  const preload = bodyReadBarrier ? `data:text/javascript,${encodeURIComponent(`
+    import { IncomingMessage } from "node:http";
+    const iterate = IncomingMessage.prototype[Symbol.asyncIterator];
+    IncomingMessage.prototype[Symbol.asyncIterator] = function (...args) {
+      if (this.method === "POST" && this.url === "/v1/chat/completions") {
+        process.send({ type: "test-body-read-started" });
+      }
+      return iterate.apply(this, args);
+    };
+  `)}` : undefined;
   const child = spawn(
     process.execPath,
-    [path.join(root, "src", "antigravity-oauth-forwarder.mjs")],
+    [...(preload ? ["--import", preload] : []), path.join(root, "src", "antigravity-oauth-forwarder.mjs")],
     {
       cwd: root,
       env: {
@@ -91,7 +132,7 @@ function startForwarder(port, upstreamUrl, tokenPath, extraEnv = {}) {
         MODEL_ROUTER_QUIET: "1",
         ...extraEnv,
       },
-      stdio: ["ignore", "ignore", "pipe"],
+      stdio: ["ignore", "ignore", "pipe", ...(bodyReadBarrier ? ["ipc"] : [])],
     },
   );
   child.stderr.setEncoding("utf8");
@@ -100,6 +141,24 @@ function startForwarder(port, upstreamUrl, tokenPath, extraEnv = {}) {
     errors += chunk;
   });
   child.testErrors = () => errors;
+  if (bodyReadBarrier) {
+    child.waitForBodyRead = () => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => finish(new Error("forwarder did not start reading the request body")), 5_000);
+      const onMessage = (message) => {
+        if (message.type === "test-body-read-started") finish();
+      };
+      const onExit = () => finish(new Error(`forwarder exited before reading the body: ${errors}`));
+      function finish(error) {
+        clearTimeout(timer);
+        child.off("message", onMessage);
+        child.off("exit", onExit);
+        if (error) reject(error);
+        else resolve();
+      }
+      child.on("message", onMessage);
+      child.once("exit", onExit);
+    });
+  }
   return child;
 }
 
@@ -134,9 +193,9 @@ function errorFrame(body) {
   return undefined;
 }
 
-async function exerciseStreamFailure(upstreamHandler, expected, extraEnv = {}) {
+async function exerciseStreamFailure(t, upstreamHandler, expected, extraEnv = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-stream-error-"));
-  const upstream = await startMockUpstream(upstreamHandler);
+  const upstream = await startMockUpstream(upstreamHandler, t);
   const port = await openPort();
   const child = startForwarder(port, upstream.url, writeTestToken(directory), extraEnv);
   const base = `http://127.0.0.1:${port}`;
@@ -210,14 +269,14 @@ function beginSlowChatRequest(base) {
   return { request, responsePromise };
 }
 
-test("rejects an omitted forced Claude tool locally before OAuth or upstream work", async () => {
+test("rejects an omitted forced Claude tool locally before OAuth or upstream work", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-local-shape-"));
   let upstreamCalls = 0;
   const upstream = await startMockUpstream((_request, response) => {
     upstreamCalls += 1;
     response.writeHead(500);
     response.end();
-  });
+  }, t);
   const port = await openPort();
   const tokenPath = writeTestToken(directory);
   const child = startForwarder(port, upstream.url, tokenPath);
@@ -367,13 +426,13 @@ test("terminal grace is one absolute window even while later SSE members trickle
   assert.ok(handled > 1, "the grace window should inspect trailers that have already arrived");
 });
 
-test("the local boundary refuses unverified sessions without upstream traffic", async () => {
+test("the local boundary refuses unverified sessions without upstream traffic", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-unverified-"));
   let upstreamCalls = 0;
   const upstream = await startMockUpstream((_request, response) => {
     upstreamCalls += 1;
     response.writeHead(500).end();
-  });
+  }, t);
   const port = await openPort();
   const child = startForwarder(
     port,
@@ -404,21 +463,22 @@ test("the local boundary refuses unverified sessions without upstream traffic", 
   }
 });
 
-test("a slow request body cannot cross a session replacement", async () => {
+test("a slow request body cannot cross a session replacement", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-slow-session-"));
   let upstreamCalls = 0;
   const upstream = await startMockUpstream((_request, response) => {
     upstreamCalls += 1;
     response.writeHead(500).end();
-  });
+  }, t);
   const port = await openPort();
   const tokenPath = writeTestToken(directory);
-  const child = startForwarder(port, upstream.url, tokenPath);
+  const child = startForwarder(port, upstream.url, tokenPath, {}, { bodyReadBarrier: true });
   const base = `http://127.0.0.1:${port}`;
   try {
     await waitForForwarder(base, child);
+    const admitted = child.waitForBodyRead();
     const slow = beginSlowChatRequest(base);
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await admitted;
     writeTestToken(directory, {
       overrides: {
         session_generation: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
@@ -438,21 +498,22 @@ test("a slow request body cannot cross a session replacement", async () => {
   }
 });
 
-test("a slow request body cannot outlive proof invalidation", async () => {
+test("a slow request body cannot outlive proof invalidation", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-slow-proof-"));
   let upstreamCalls = 0;
   const upstream = await startMockUpstream((_request, response) => {
     upstreamCalls += 1;
     response.writeHead(500).end();
-  });
+  }, t);
   const port = await openPort();
   const tokenPath = writeTestToken(directory);
-  const child = startForwarder(port, upstream.url, tokenPath);
+  const child = startForwarder(port, upstream.url, tokenPath, {}, { bodyReadBarrier: true });
   const base = `http://127.0.0.1:${port}`;
   try {
     await waitForForwarder(base, child);
+    const admitted = child.waitForBodyRead();
     const slow = beginSlowChatRequest(base);
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await admitted;
     writeTestToken(directory, { verified: false });
     slow.request.end('{"role":"user","content":"must stay local"}]}');
     const result = await slow.responsePromise;
@@ -466,7 +527,7 @@ test("a slow request body cannot outlive proof invalidation", async () => {
   }
 });
 
-test("a 401 retry cannot cross a disconnect-reconnect session generation", async () => {
+test("a 401 retry cannot cross a disconnect-reconnect session generation", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-401-generation-"));
   let upstreamCalls = 0;
   const tokenPath = writeTestToken(directory);
@@ -481,7 +542,7 @@ test("a 401 retry cannot cross a disconnect-reconnect session generation", async
     });
     response.writeHead(401, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: { message: "expired" } }));
-  });
+  }, t);
   const port = await openPort();
   const child = startForwarder(port, upstream.url, tokenPath);
   const base = `http://127.0.0.1:${port}`;
@@ -508,7 +569,7 @@ test("a 401 retry cannot cross a disconnect-reconnect session generation", async
   }
 });
 
-test("a 401 retry cannot outlive proof invalidation in the same session", async () => {
+test("a 401 retry cannot outlive proof invalidation in the same session", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-401-proof-"));
   let upstreamCalls = 0;
   const tokenPath = writeTestToken(directory);
@@ -517,7 +578,7 @@ test("a 401 retry cannot outlive proof invalidation in the same session", async 
     writeTestToken(directory, { verified: false });
     response.writeHead(401, { "Content-Type": "application/json" });
     response.end(JSON.stringify({ error: { message: "expired" } }));
-  });
+  }, t);
   const port = await openPort();
   const child = startForwarder(port, upstream.url, tokenPath);
   const base = `http://127.0.0.1:${port}`;
@@ -544,7 +605,7 @@ test("a 401 retry cannot outlive proof invalidation in the same session", async 
   }
 });
 
-test("endpoint fallback reasserts the exact active proof before another attempt", async () => {
+test("endpoint fallback reasserts the exact active proof before another attempt", async (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "antigravity-fallback-proof-"));
   let dailyCalls = 0;
   let productionCalls = 0;
@@ -554,11 +615,11 @@ test("endpoint fallback reasserts the exact active proof before another attempt"
     writeTestToken(directory, { verified: false });
     response.writeHead(503, { "Content-Type": "application/json" });
     response.end("{}");
-  });
+  }, t);
   const production = await startMockUpstream((_request, response) => {
     productionCalls += 1;
     response.writeHead(500).end();
-  });
+  }, t);
   const port = await openPort();
   const child = startForwarder(port, daily.url, tokenPath, {
     ANTIGRAVITY_PROD_ENDPOINT: production.url,
@@ -658,8 +719,8 @@ test("preserves provider statuses and safe retry headers", () => {
   }
 });
 
-test("ends a started stream with an OpenAI error frame for an embedded 429", async () => {
-  await exerciseStreamFailure((_request, response) => {
+test("ends a started stream with an OpenAI error frame for an embedded 429", async (t) => {
+  await exerciseStreamFailure(t, (_request, response) => {
     response.writeHead(200, { "Content-Type": "text/event-stream" });
     response.write(sse({
       response: { candidates: [{ content: { parts: [{ text: "partial" }] } }] },
@@ -674,8 +735,8 @@ test("ends a started stream with an OpenAI error frame for an embedded 429", asy
   });
 });
 
-test("ends a started stream with an OpenAI error frame after an idle timeout", async () => {
-  await exerciseStreamFailure((_request, response) => {
+test("ends a started stream with an OpenAI error frame after an idle timeout", async (t) => {
+  await exerciseStreamFailure(t, (_request, response) => {
     response.writeHead(200, { "Content-Type": "text/event-stream" });
     response.write(sse({
       response: { candidates: [{ content: { parts: [{ text: "partial" }] } }] },
@@ -689,8 +750,8 @@ test("ends a started stream with an OpenAI error frame after an idle timeout", a
   });
 });
 
-test("ends a started stream with an OpenAI error frame after a clean incomplete EOF", async () => {
-  await exerciseStreamFailure((_request, response) => {
+test("ends a started stream with an OpenAI error frame after a clean incomplete EOF", async (t) => {
+  await exerciseStreamFailure(t, (_request, response) => {
     response.writeHead(200, { "Content-Type": "text/event-stream" });
     response.end(sse({
       response: { candidates: [{ content: { parts: [{ text: "partial" }] } }] },

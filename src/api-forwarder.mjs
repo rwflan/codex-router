@@ -1,3 +1,6 @@
+import { compatibilityLayerError } from "./compatibility-layer-state.mjs";
+import { rejectGenerationRedirect } from "./generation-redirect.mjs";
+import { normalizeAzureOpenAIResponsesRequest } from "./azure-openai-compat.mjs";
 import http from "node:http";
 import {
   requiresReasoningContentOnToolCalls,
@@ -20,6 +23,7 @@ import {
   applyKeepAliveTimeouts,
   endStreamedResponse,
   formatErrorChain,
+  foldInterveningAssistantMessages,
   HOP_BY_HOP_HEADERS,
   httpErrorStatus,
   installGracefulShutdown,
@@ -34,6 +38,7 @@ import { PORTS, TARGET } from "./paths.mjs";
 import {
   API_MODELS,
   MODEL_BY_GATEWAY_ID,
+  COMPATIBILITY_DISABLED_MODELS,
   PROVIDERS,
   RUNTIME_PROVIDERS,
   providerForModel,
@@ -69,6 +74,7 @@ import { relayCommandCodeGenerate } from "./commandcode-relay.mjs";
 import { VERSION } from "./version.mjs";
 import { installStableFetchTransport } from "./fetch-transport.mjs";
 import { zaiCacheUsageTransform } from "./zai-cache-usage.mjs";
+import { GrokChatServiceTierTransform, grokChatServiceTierBody } from "./grok-service-tier-compat.mjs";
 import {
   buildNamespaceLookupsFromTools,
   createResponsesJsonTransform,
@@ -77,7 +83,20 @@ import {
 } from "./openai-adapters.mjs";
 import { threadIdFromHeaders } from "./codex-session-names.mjs";
 import { applyOpenCodeSessionHeaders, isOpenCodeProvider } from "./opencode-session.mjs";
+import {
+  applyOpenCodeFreeFingerprint,
+  applyOpenCodeFreeLaneHeaders,
+  isOpenCodeFreeLaneProvider,
+  openCodeFreeFingerprintStyle,
+} from "./opencode-free-lane.mjs";
 import { clampOpenCodeMessageContent } from "./opencode-message-compat.mjs";
+import {
+  ensureOpenCodeGeminiThoughtSignatures,
+  isOpenCodeGeminiModel,
+  OPENCODE_GEMINI_BASE_URL,
+  OPENCODE_GEMINI_BASE_URL_ENV,
+  openCodeGeminiModelFromRoute,
+} from "./opencode-gemini.mjs";
 import {
   effectiveProviderCredentialStatus,
   providerApiKeyAuthoritySnapshot,
@@ -94,8 +113,17 @@ import {
   stripCodexEncryptedSchemaAnnotation,
 } from "./tool-schema-root.mjs";
 import { requestGenericProvider } from "./generic-providers.mjs";
+import { genericProviderWebSocketTarget } from "./generic-providers.mjs";
 import { genericProviderConfigured } from "./generic-provider-readiness.mjs";
 import { withoutInputMessagePhase } from "./message-phase.mjs";
+import {
+  WsUpgradeRefusedError,
+  collectResponsesRequest,
+  markWsTransportFailure,
+  responsesWebSocketTransportUsable,
+  wsTransportAvailable,
+} from "./responses-ws-client.mjs";
+import { providerPoolRegistry } from "./provider-ws-pool.mjs";
 import { providerTransportError } from "./transport-failure.mjs";
 import {
   endpointCapabilityError,
@@ -287,55 +315,6 @@ function dashscopeEffortFamily(upstreamModel) {
   return DASHSCOPE_EFFORT_FAMILIES.find((entry) => entry.match.test(upstream));
 }
 
-// Strict chat-completions providers (e.g. MiniMax) reject a turn whose tool
-// result messages do not immediately follow the assistant message carrying the
-// matching tool_calls. When the upstream Responses-API history is translated to
-// chat completions, an assistant turn that produced both tool_calls and a text
-// message can arrive as two consecutive assistant messages (one with
-// tool_calls, one with the text), so the tool results no longer follow the
-// tool-call-bearing assistant. Coalesce runs of consecutive assistant messages
-// into a single assistant message (combining content and tool_calls) so the
-// chat-completions contract holds. This is a safe normalization: consecutive
-// assistant messages are not a valid multi-turn shape, so merging them cannot
-// change a well-formed conversation.
-function combineAssistantContent(target, source) {
-  const sourceContent = source.content;
-  if (sourceContent === undefined || sourceContent === null) return;
-  const targetContent = target.content;
-  if (targetContent === undefined || targetContent === null || targetContent === "") {
-    target.content = sourceContent;
-    return;
-  }
-  if (typeof targetContent === "string" && typeof sourceContent === "string") {
-    target.content = `${targetContent}\n${sourceContent}`;
-    return;
-  }
-  const targetBlocks = Array.isArray(targetContent) ? targetContent : [targetContent];
-  const sourceBlocks = Array.isArray(sourceContent) ? sourceContent : [sourceContent];
-  target.content = [...targetBlocks, ...sourceBlocks];
-}
-
-function coalesceAssistantMessages(messages) {
-  if (!Array.isArray(messages) || messages.length < 2) return messages;
-  const coalesced = [];
-  for (const message of messages) {
-    const previous = coalesced[coalesced.length - 1];
-    if (
-      message?.role === "assistant" &&
-      previous?.role === "assistant" &&
-      (Array.isArray(previous.tool_calls) || Array.isArray(message.tool_calls))
-    ) {
-      combineAssistantContent(previous, message);
-      if (Array.isArray(message.tool_calls) && message.tool_calls.length) {
-        previous.tool_calls = [...(previous.tool_calls || []), ...message.tool_calls];
-      }
-      continue;
-    }
-    coalesced.push(message);
-  }
-  return coalesced;
-}
-
 function restoreNativeReasoningContent(messages) {
   if (!Array.isArray(messages)) return messages;
   return messages.map((message) => {
@@ -421,6 +400,13 @@ function toolCallIds(message) {
 
 function ensureToolResultsForCalls(messages) {
   if (!Array.isArray(messages) || messages.length === 0) return messages;
+  // The shared fold preserves assistant runs whose opaque metadata conflicts.
+  // Their real results may follow those unmerged items. Keep that ambiguous
+  // history for upstream rejection instead of replacing results with stubs.
+  if (messages.some((message, index) => (
+    message?.role === "assistant" && toolCallIds(message).length > 0
+    && messages[index + 1]?.role === "assistant"
+  ))) return messages;
   const repaired = [];
   let index = 0;
   while (index < messages.length) {
@@ -815,7 +801,8 @@ function trimTrailingModelTurns(messages) {
 
 function sanitizeChatToolHistory(messages, provider, model) {
   if (!Array.isArray(messages)) return messages;
-  const repaired = ensureToolResultsForCalls(coalesceAssistantMessages(messages));
+  foldInterveningAssistantMessages(messages);
+  const repaired = ensureToolResultsForCalls(messages);
   let cleaned = repaired;
   if (isGeminiProvider(provider, model)) {
     cleaned = ensureGeminiThoughtSignatures(sanitizeGeminiImageContent(repaired));
@@ -1027,12 +1014,24 @@ function normalizeBody(buffer, contentType, route) {
   // no upstream provider consumes; strict providers reject the unknown field outright.
   delete payload.client_metadata;
   delete payload.access_programs;
-  const requestedModel = String(payload.model || "");
+  const nativeGeminiModel = openCodeGeminiModelFromRoute(route);
+  const requestedModel = String(payload.model || nativeGeminiModel || "");
+  if (COMPATIBILITY_DISABLED_MODELS.has(requestedModel.replace(/^responses\//, ""))) {
+    const error = new Error(compatibilityLayerError(requestedModel).error.message);
+    error.status = 409;
+    error.code = "compatibility_layer_disabled";
+    throw error;
+  }
   // LiteLLM's Responses bridge prefixes the gateway id with `responses/` on
   // the upstream wire format; the forwarder still owns the id translation.
   const model =
     MODEL_BY_GATEWAY_ID.get(requestedModel.replace(/^responses\//, "")) ||
-    MODEL_BY_GATEWAY_ID.get(requestedModel);
+    MODEL_BY_GATEWAY_ID.get(requestedModel) ||
+    API_MODELS.find(
+      (candidate) =>
+        isOpenCodeGeminiModel(candidate) &&
+        candidate.upstreamModel === nativeGeminiModel,
+    );
   const provider = model && providerForModel(model);
   const adapter = vertexAdapterForModel(model, provider);
   if (!model || provider?.kind !== "openai-compatible") {
@@ -1040,15 +1039,18 @@ function normalizeBody(buffer, contentType, route) {
     error.status = 400;
     throw error;
   }
-  const expectedRoute =
-    adapter?.route ||
-    (provider.protocol === "anthropic"
-      ? "/messages"
-      : provider.protocol === "openai-responses"
-        ? "/responses"
-        : provider.protocol === "openai-decisions"
-          ? "/decisions"
-        : "/chat/completions");
+  const openCodeGeminiNative = isOpenCodeGeminiModel(model) &&
+    nativeGeminiModel === model.upstreamModel;
+  const expectedRoute = openCodeGeminiNative
+    ? route
+    : adapter?.route ||
+      (provider.protocol === "anthropic"
+        ? "/messages"
+        : provider.protocol === "openai-responses"
+          ? "/responses"
+          : provider.protocol === "openai-decisions"
+            ? "/decisions"
+          : "/chat/completions");
   if (
     route === "/embeddings"
       ? !supportsOpenAIModelEndpoint(route, { model, provider })
@@ -1062,6 +1064,26 @@ function normalizeBody(buffer, contentType, route) {
     const error = new Error(`Model ${model.gatewayModel} does not support ${route}.`);
     error.status = 400;
     throw error;
+  }
+
+  if (openCodeGeminiNative) {
+    // LiteLLM writes native Gemini history with snake_case function_call
+    // parts. Older synthetic tool-call history has no signature, which Gemini
+    // rejects before it can read the function response.
+    ensureOpenCodeGeminiThoughtSignatures(payload);
+    delete payload.model;
+    return {
+      body: Buffer.from(JSON.stringify(payload), "utf8"),
+      model,
+      provider,
+      endpoint: {
+        ...provider,
+        baseUrl: OPENCODE_GEMINI_BASE_URL,
+        baseUrlEnv: OPENCODE_GEMINI_BASE_URL_ENV,
+      },
+      payload,
+      targetPath: route,
+    };
   }
 
   payload.model = model.upstreamModel;
@@ -1094,6 +1116,38 @@ function normalizeBody(buffer, contentType, route) {
       delete payload.thinking;
     }
     payload = normalizeOpenAIRequest(payload);
+    payload = normalizeAzureOpenAIResponsesRequest(payload, { providerId: model.provider, route });
+    if (usesDeepSeekResponses(model) && payload.reasoning.effort !== "none" &&
+      (payload.tool_choice === "required" || (payload.tool_choice?.type === "function" &&
+        typeof payload.tool_choice.name === "string" && payload.tool_choice.name) ||
+        (payload.tool_choice?.type === "allowed_tools" && payload.tool_choice.mode === "required"))) {
+      // Native DeepSeek Responses rejects forced tools while thinking. Omitting
+      // the choice leaves tools available under the upstream default. For a
+      // named or required allowed-tools choice, offer only those tools. Leave
+      // unknown or malformed restrictions invalid rather than widening access.
+      if (payload.tool_choice === "required") {
+        delete payload.tool_choice;
+      } else if (payload.tool_choice.type === "function") {
+        const matches = payload.tools?.filter((tool) => tool.name === payload.tool_choice.name);
+        if (matches?.length === 1) {
+          payload.tools = matches;
+          delete payload.tool_choice;
+        }
+      } else {
+        const allowed = payload.tool_choice.tools;
+        if (Array.isArray(allowed) && allowed.length > 0 &&
+          allowed.every((tool) => ["function", "custom"].includes(tool?.type) &&
+            typeof tool.name === "string" && tool.name)) {
+          const keys = new Set(allowed.map((tool) => `${tool.type}\0${tool.name}`));
+          const matches = allowed.map((choice) => payload.tools?.filter((tool) =>
+            tool.type === choice.type && tool.name === choice.name));
+          if (keys.size === allowed.length && matches.every((group) => group?.length === 1)) {
+            payload.tools = matches.map((group) => group[0]);
+            delete payload.tool_choice;
+          }
+        }
+      }
+    }
     // The router labels routed assistant messages with Codex's `phase`, and
     // Codex replays it on every later turn. An operator-configured Responses
     // endpoint is an unknown validator, so it gets the pre-label history
@@ -1520,6 +1574,11 @@ function normalizeBody(buffer, contentType, route) {
     }
   }
   if (adapter) payload = adapter.normalizeBody(payload, model);
+  // OpenCode's anonymous free lane needs the public CLI fingerprint on the
+  // body (official read/shell defs + <env>) before the bytes leave the box.
+  if (isOpenCodeFreeLaneProvider(provider)) {
+    applyOpenCodeFreeFingerprint(payload, openCodeFreeFingerprintStyle(route));
+  }
   const targetPath = adapter?.targetPath
     ? adapter.targetPath({ model, body: payload })
     : undefined;
@@ -1529,6 +1588,7 @@ function normalizeBody(buffer, contentType, route) {
   const endpoint = endpointForModel(model);
   return {
     body: Buffer.from(JSON.stringify(payload), "utf8"),
+    route,
     model,
     provider,
     endpoint,
@@ -1553,7 +1613,12 @@ function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = 
   ]);
   for (const [name, value] of Object.entries(requestHeaders)) {
     const lower = name.toLowerCase();
-    if (HOP_BY_HOP_HEADERS.has(lower) || lower === "authorization" || lower === "x-api-key") continue;
+    if (
+      HOP_BY_HOP_HEADERS.has(lower) ||
+      lower === "authorization" ||
+      lower === "x-api-key" ||
+      lower === "x-goog-api-key"
+    ) continue;
     if (provider.protocol === "vertex" && lower === "anthropic-version") continue;
     if (provider.authProfile === "github-copilot" && providerIdentityHeaders.has(lower)) continue;
     if (lower.startsWith("x-msh-") || lower.startsWith("x-codex-")) continue;
@@ -1584,10 +1649,42 @@ function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = 
     requestHeaders,
     body,
   });
+  // The anonymous free lane overrides UA, Authorization, and session headers
+  // with the public CLI fingerprint. Must run after the generic session merge
+  // so a UUID x-opencode-session cannot leave FreeTierError on the wire.
+  applyOpenCodeFreeLaneHeaders(headers, {
+    provider,
+    requestHeaders,
+    body,
+  });
   // Content-Length is fetch's to compute. An explicit copy is at best
   // redundant, and the HTTP/1.1 dispatcher rejects the request outright
   // (UND_ERR_INVALID_ARG) when a caller-supplied value accompanies a body.
   return headers;
+}
+
+// The reasons Cline is known to put in an unsuccessful envelope, each mapped
+// to a diagnosis the router words itself. Anything else gets the generic
+// sentence: an unrecognized upstream string may echo prompt or account text.
+const CLINEPASS_REFUSALS = new Map([
+  [
+    "empty response content",
+    {
+      code: "clinepass_empty_response",
+      message:
+        "ClinePass returned no content for this non-streaming request. The same model usually answers when the request is streamed.",
+    },
+  ],
+]);
+
+function clinePassRefusal(reason) {
+  const known = typeof reason === "string"
+    ? CLINEPASS_REFUSALS.get(reason.trim().toLowerCase())
+    : undefined;
+  return known || {
+    code: "clinepass_unsuccessful_response",
+    message: "ClinePass answered with an unsuccessful response and no completion.",
+  };
 }
 
 async function relayUpstreamResponse(
@@ -1597,7 +1694,79 @@ async function relayUpstreamResponse(
   startedAt,
   telemetryUpstream = upstream,
 ) {
+  await rejectGenerationRedirect(upstream);
   const upstreamContentType = upstream.headers.get("content-type") || "";
+  const grokChat = normalized.provider.id === "grok-api" && normalized.route === "/chat/completions" && upstream.ok;
+  const grokStream = grokChat && upstreamContentType.toLowerCase().includes("text/event-stream");
+  if (grokChat && upstream.body && upstreamContentType.toLowerCase().includes("application/json")) {
+    const actual = grokChatServiceTierBody(await readResponseBody(upstream));
+    if (actual.serviceTier) response.setHeader("x-codex-router-grok-service-tier", actual.serviceTier);
+    const headers = new Headers(upstream.headers);
+    headers.delete("content-length");
+    headers.delete("content-encoding");
+    headers.delete("x-codex-router-grok-service-tier");
+    upstream = new Response(actual.body, { status: upstream.status, statusText: upstream.statusText, headers });
+  }
+  if (
+    normalized.provider.id === "clinepass" &&
+    normalized.route === "/chat/completions" &&
+    upstream.ok && upstream.body &&
+    upstreamContentType.toLowerCase().includes("application/json")
+  ) {
+    // Cline's non-streaming API wraps successful completions in success/data.
+    // LiteLLM needs choices at the root. Buffer under the shared upstream limit
+    // before committing any bytes, and leave unknown shapes intact.
+    let body = await readResponseBody(upstream);
+    let refusal;
+    try {
+      const envelope = JSON.parse(body.toString("utf8"));
+      if (
+        envelope?.success === true &&
+        envelope.data && typeof envelope.data === "object" &&
+        !Array.isArray(envelope.data) && Array.isArray(envelope.data.choices)
+      ) {
+        body = Buffer.from(JSON.stringify(envelope.data), "utf8");
+      } else if (
+        envelope && typeof envelope === "object" && !Array.isArray(envelope) &&
+        envelope.success === false && !Array.isArray(envelope.choices)
+      ) {
+        refusal = clinePassRefusal(envelope.error);
+      }
+    } catch {
+      // Malformed JSON belongs to the upstream; relay the original bytes.
+    }
+    if (refusal) {
+      // An HTTP 200 that Cline itself marks unsuccessful carries no root
+      // `choices`, so relaying it intact only moved the failure one hop: the
+      // gateway answered 500 "provider returned a response with no 'choices'"
+      // and the real cause never reached the caller (#938). Say what happened
+      // with a gateway-shaped error instead. The message is a fixed diagnosis
+      // chosen by an allowlisted reason; no upstream text is relayed or logged.
+      //
+      // 500, not 502: the origin ran and answered, so this is not a failure an
+      // intermediary may repeat. The gateway would still retry any 5xx, which
+      // is why ClinePass deployments are single-shot in litellm-config.mjs.
+      recordUpstreamLimits(normalized, telemetryUpstream);
+      if (!QUIET) {
+        console.error(
+          `[api-forwarder] provider=${normalized.provider.id} model=${normalized.model.upstreamModel} status=${upstream.status} refused=${refusal.code} duration_ms=${Date.now() - startedAt}`,
+        );
+      }
+      writeJson(response, 500, {
+        error: {
+          type: "provider_api_proxy_error",
+          code: refusal.code,
+          message: refusal.message,
+        },
+      });
+      return;
+    }
+    upstream = new Response(body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: upstream.headers,
+    });
+  }
   const responsesStream = normalized.responseAdapter === "responses" &&
     upstream.ok && upstreamContentType.toLowerCase().includes("text/event-stream");
   const responsesJson = normalized.responseAdapter === "responses" &&
@@ -1625,17 +1794,28 @@ async function relayUpstreamResponse(
     responsesStream
       ? createResponsesStreamTransform(flatToNative, {
           pinResponseId: normalized.provider.authProfile === "github-copilot",
+          // Not gated on QUIET: this is the only place the reason is ever
+          // written down. The gateway relays the frame as a bare "in-stream
+          // error", so without this line a refused stream cannot be diagnosed
+          // from any log (#837).
+          // User-model IDs may contain controls or be large; keep one bounded line.
+          onInvalid: (reason) => console.error(
+            `[api-forwarder] refused Responses stream provider=${JSON.stringify(String(normalized.provider.id).slice(0, 256))} model=${JSON.stringify(String(normalized.model.upstreamModel).slice(0, 256))}: ${reason}`,
+          ),
         })
       : undefined,
     responsesJson ? createResponsesJsonTransform(flatToNative) : undefined,
+    grokStream ? new GrokChatServiceTierTransform() : undefined,
     zaiCacheUsageTransform(normalized.provider.id, upstreamContentType),
   ].filter(Boolean);
   const denylist = transform.length
     ? new Set([...HOP_BY_HOP_HEADERS, "content-type"])
     : undefined;
+  if (grokStream) denylist.add("x-codex-router-grok-service-tier");
   if (responsesStream) response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   if (responsesJson) response.setHeader("Content-Type", "application/json; charset=utf-8");
   if (replayJson && !responsesJson) response.setHeader("Content-Type", upstreamContentType);
+  if (grokStream) response.setHeader("Content-Type", upstreamContentType);
   await pipeResponse(upstream, response, denylist, transform);
   recordUpstreamLimits(normalized, telemetryUpstream);
   if (!QUIET) {
@@ -1752,6 +1932,50 @@ function localModels(response) {
   });
 }
 
+// Keep canonical normalized full requests and transforms; only replace the
+// upstream transport. Continuations without full input remain on HTTP.
+const genericProviderPools = providerPoolRegistry({
+  resolveProvider: (providerId, requestPath) => ({
+    wsTarget: () => genericProviderWebSocketTarget(providerId, requestPath),
+  }),
+});
+
+function genericWsBreakerKey(providerId) {
+  return `generic-ws:${providerId}`;
+}
+
+async function acquireGenericWebSocketResponses(normalized, controller, requestPath) {
+  const providerId = normalized.provider.id;
+  if (!wsTransportAvailable(genericWsBreakerKey(providerId))) return undefined;
+  if (!responsesWebSocketTransportUsable()) return undefined;
+  let payload;
+  try { payload = JSON.parse(normalized.body.toString("utf8")); } catch { return undefined; }
+  if (payload?.stream !== true || !Array.isArray(payload.input) || payload.previous_response_id) return undefined;
+  let lease;
+  try {
+    const pool = await genericProviderPools.poolFor(providerId, requestPath);
+    lease = await pool.acquire(controller.signal);
+  } catch (error) {
+    if (controller.signal.aborted) throw error;
+    markWsTransportFailure(genericWsBreakerKey(providerId));
+    console.warn("[api-forwarder] websocket transport unavailable provider=%s%s; using HTTP", providerId,
+      error instanceof WsUpgradeRefusedError && error.status !== undefined ? ` upgrade_status=${error.status}` : "");
+    return undefined;
+  }
+  let result;
+  try {
+    result = await collectResponsesRequest(lease.connection, payload, {
+      signal: controller.signal,
+      onSettled: () => lease.release(),
+    });
+  } catch (error) {
+    lease.connection.abort();
+    lease.release();
+    throw error;
+  }
+  return { result };
+}
+
 async function handleRequest(request, response) {
   const startedAt = Date.now();
   const requestUrl = new URL(
@@ -1772,7 +1996,8 @@ async function handleRequest(request, response) {
   }
   if (
     request.method !== "POST" ||
-    !["/chat/completions", "/messages", "/responses", "/embeddings", "/decisions"].includes(route)
+    (!["/chat/completions", "/messages", "/responses", "/embeddings", "/decisions"].includes(route) &&
+      !openCodeGeminiModelFromRoute(route))
   ) {
     writeJson(response, 404, {
       error: { type: "proxy_route_not_found", message: "Unsupported API-provider route." },
@@ -1794,6 +2019,13 @@ async function handleRequest(request, response) {
   // resolve it through the built-in credential path or construct its URL here;
   // either would bypass the confinement #404 established.
   if (normalized.provider.generic === true) {
+    if (normalized.provider.transport === "websocket" && normalized.provider.protocol === "openai-responses" && route === "/responses") {
+      const ws = await acquireGenericWebSocketResponses(normalized, controller, `${route}${requestUrl.search}`);
+      if (ws) {
+        await relayUpstreamResponse(normalized, ws.result, response, startedAt);
+        return;
+      }
+    }
     const { response: upstream, dispatcher } = await requestGenericProvider(
       normalized.provider.id,
       `${route}${requestUrl.search}`,
@@ -1968,9 +2200,9 @@ async function handleRequest(request, response) {
           ),
           body: upstreamBody,
           signal: controller.signal,
-          redirect: ["/embeddings", "/decisions"].includes(route) ? "error" : "follow",
+          redirect: ["/embeddings", "/decisions"].includes(route) ? "error" : "manual",
         });
-        let attemptResponse = await sendAttempt();
+        let attemptResponse = await rejectGenerationRedirect(await sendAttempt());
         // The source credential can still be valid when Copilot changes the
         // account's inference endpoint or short-lived routing token. Preserve
         // the existing same-key force-refresh contract inside each pool
@@ -1986,7 +2218,7 @@ async function handleRequest(request, response) {
             normalized.endpoint,
           );
           attemptTarget = upstreamTarget(attemptSession, normalized, route, requestUrl.search);
-          attemptResponse = await sendAttempt();
+          attemptResponse = await rejectGenerationRedirect(await sendAttempt());
         }
         if (!attemptResponse.ok) {
           const bodyText = (await readResponseBody(attemptResponse, {
@@ -2043,6 +2275,7 @@ async function handleRequest(request, response) {
       },
     });
     const result = pooled.result;
+    if (!pooled.committed && pooled.error?.code === "upstream_redirect_refused") throw pooled.error;
     if (result?.upstreamHeaders) {
       // Plan attempts keep their provider headers separate from the safe error
       // headers relayed to the caller. Only the result the pool selected may
@@ -2099,8 +2332,9 @@ async function handleRequest(request, response) {
       ),
       body: upstreamBody,
       signal: controller.signal,
-      redirect: ["/embeddings", "/decisions"].includes(route) ? "error" : "follow",
+      redirect: ["/embeddings", "/decisions"].includes(route) ? "error" : "manual",
     });
+    await rejectGenerationRedirect(upstream);
     // Embeddings and Decisions can be billed even when the response never
     // reaches the caller. Select one pool credential above and record its
     // outcome, but do not replay the same input through another credential
@@ -2146,7 +2380,9 @@ async function handleRequest(request, response) {
       ),
       body: upstreamBody,
       signal: controller.signal,
+      redirect: "manual",
     });
+    await rejectGenerationRedirect(upstream);
   }
   // Falling back here is legal for the same reason the Copilot replay above
   // is: nothing has been relayed yet. The refusal is read rather than piped
@@ -2200,7 +2436,9 @@ async function handleRequest(request, response) {
 
 const server = http.createServer((request, response) => {
   handleRequest(request, response).catch((error) => {
-    const status = httpErrorStatus(error);
+    // A final endpoint is a configuration requirement, not a transient 5xx.
+    // LiteLLM and other callers must not retry the consumed origin request.
+    const status = error?.code === "upstream_redirect_refused" ? 400 : httpErrorStatus(error);
     const transport = providerTransportError(error);
     // Names and codes only: a forwarder failure can wrap upstream response
     // text in its message, and bodies never belong in the log. The code chain
@@ -2210,10 +2448,14 @@ const server = http.createServer((request, response) => {
     );
     if (!response.headersSent) {
       writeJson(response, status, {
-        error: transport || {
+        error: error.code === "compatibility_layer_disabled"
+          ? compatibilityLayerError("the requested route").error : transport || (error?.code === "upstream_redirect_refused" ? {
+          type: "provider_redirect_refused",
+          message: error.message,
+        } : {
           type: "provider_api_proxy_error",
           message: "The API-provider forwarder could not complete the request.",
-        },
+        }),
       });
     } else if (!response.writableEnded) {
       endStreamedResponse(response, {
@@ -2230,3 +2472,7 @@ server.listen(LISTEN_PORT, LISTEN_HOST, () => {
 });
 
 installGracefulShutdown(server, { label: "api-forwarder" });
+// Pooled upstream WebSocket connections hold sockets open past the HTTP
+// server's own drain; shut them down with the process.
+process.once("SIGTERM", () => genericProviderPools.closeAll());
+process.once("SIGINT", () => genericProviderPools.closeAll());

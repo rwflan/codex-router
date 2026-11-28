@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -16,6 +16,62 @@ import {
 } from "../src/file-security.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+test("Windows private helpers preserve isolated AppData paths without provider credentials", {
+  skip: process.platform !== "win32",
+}, () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "private-helper-environment-"));
+  const roaming = path.join(directory, "Roaming");
+  const local = path.join(directory, "Local");
+  mkdirSync(roaming);
+  mkdirSync(local);
+  const moduleUrl = new URL("../src/file-security.mjs", import.meta.url).href;
+  const driver = `
+    import assert from 'node:assert/strict';
+    import childProcess from 'node:child_process';
+    import { syncBuiltinESMExports } from 'node:module';
+    import path from 'node:path';
+    const observedLaunches = new Set();
+    function inspect(options, mode) {
+      if (!options?.env?.CODEX_ROUTER_PRIVATE_FILES) return;
+      assert.equal(options.env.APPDATA, process.env.APPDATA);
+      assert.equal(options.env.LOCALAPPDATA, process.env.LOCALAPPDATA);
+      for (const name of ['PROBE_API_KEY', 'CODEX_ROUTER_CALLER_KEY', 'NODE_OPTIONS']) {
+        assert.equal(options.env[name], undefined, name + ' must not reach the ACL helper');
+      }
+      observedLaunches.add(mode);
+    }
+    const originalSync = childProcess.execFileSync;
+    childProcess.execFileSync = function(file, args, options) {
+      inspect(options, 'sync'); return originalSync.apply(this, arguments);
+    };
+    const originalSpawn = childProcess.spawn;
+    childProcess.spawn = function(file, args, options) {
+      inspect(options, 'async'); return originalSpawn.apply(this, arguments);
+    };
+    syncBuiltinESMExports();
+    const security = await import(${JSON.stringify(moduleUrl)});
+    const first = path.join(process.argv[1], 'sync.json');
+    const second = path.join(process.argv[1], 'async.json');
+    security.writePrivateJson(first, { synthetic: true });
+    await security.writePrivateJsonAsync(second, { synthetic: true });
+    assert.deepEqual([...observedLaunches].sort(), ['async', 'sync'], 'Both real helper launch paths must be observed');
+    assert.equal(security.privateFileIsProtected(first), true);
+    assert.equal(security.privateFileIsProtected(second), true);
+  `;
+  try {
+    const result = spawnSync(process.execPath, ["--input-type=module", "-e", driver, directory], {
+      env: { ...process.env, USERPROFILE: directory, APPDATA: roaming, LOCALAPPDATA: local,
+        PROBE_API_KEY: "TEST_ONLY_KEY_MUST_NOT_REACH_HELPER",
+        CODEX_ROUTER_CALLER_KEY: "TEST_ONLY_CALLER_MUST_NOT_REACH_HELPER" },
+      encoding: "utf8", windowsHide: true, timeout: 30_000,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("the Windows async ACL path uses the bounded one-shot script", () => {
   const implementation = readFileSync(path.join(root, "src", "file-security.mjs"), "utf8");
@@ -316,6 +372,48 @@ test(
       ).trim().toLowerCase();
       assert.equal(result, "true", "Users should have ReadAndExecute access to the checkout");
     } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+// The record that lets the Windows service manager stop the tree it owns is
+// written before anything else starts, so a PowerShell that cannot start used
+// to take the whole router down: measured 2026-09-23, every start attempt for
+// forty minutes after a boot died on "Failed to protect private file ACL:
+// spawnSync powershell.exe ETIMEDOUT". A warn-only write must survive that; the
+// default must still fail closed, because a credential file cannot silently
+// lose its hardening.
+test(
+  "a warn-only private write survives a PowerShell that cannot run the hardening script",
+  { skip: process.platform !== "win32" },
+  () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-harden-warn-"));
+    const shadow = path.join(directory, "shadow");
+    const target = path.join(directory, "state.json");
+    const originalPath = process.env.PATH;
+    try {
+      mkdirSync(shadow);
+      // A PowerShell that cannot start at all: an executable-named file that
+      // CreateProcess rejects, which is the shape protectPrivateFilesWin32
+      // turns into "Failed to protect private file ACL". PATH is searched
+      // before the Windows directory for a bare image name, so this shadow wins
+      // over the real interpreter.
+      writeFileSync(path.join(shadow, "powershell.exe"), "not an executable\n");
+      process.env.PATH = `${shadow};${originalPath}`;
+
+      const value = { version: 1, pid: 4242 };
+      assert.deepEqual(writePrivateJson(target, value, { hardenFailure: "warn" }), value);
+      assert.deepEqual(JSON.parse(readFileSync(target, "utf8")), value);
+
+      const strict = path.join(directory, "strict.json");
+      assert.throws(
+        () => writePrivateJson(strict, value),
+        /Failed to protect private file ACL/,
+      );
+      assert.equal(existsSync(strict), false);
+    } finally {
+      process.env.PATH = originalPath;
       rmSync(directory, { recursive: true, force: true });
     }
   },

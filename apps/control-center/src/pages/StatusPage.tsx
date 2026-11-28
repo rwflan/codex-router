@@ -15,11 +15,13 @@ import { ProviderLogo } from "../provider-branding";
 import { ServiceHealthPanel } from "../ServiceHealth";
 import { useI18n } from "../i18n-react";
 import type { Translate } from "../i18n";
+import { eventGenerationPresentation, generationOutcomesSummary } from "../generation-outcome";
 import {
   compactNumber,
   exactNumber,
   formatDateTime,
   formatDuration,
+  tokenCountFromEvent,
   remainingPercent,
 } from "../lib";
 import type {
@@ -171,7 +173,7 @@ export function StatusPage({
       providerId: provider.id,
       providerName: provider.displayName,
     })))
-    .filter((model) => Number.isFinite(Number(model.observedTokensPerSecond)))
+    .filter((model) => Number.isFinite(model.observedTokensPerSecond))
     .sort((left, right) =>
       Number(right.observedTokensPerSecond) - Number(left.observedTokensPerSecond)
       || (right.speedSampleCount || 0) - (left.speedSampleCount || 0),
@@ -208,9 +210,6 @@ export function StatusPage({
   const cachedInputTokens = contextEfficiency?.last24hCachedInputTokens
     ?? eventCachedInputTokens;
   const observedInputTokens = events.reduce((sum, event) => sum + (event.inputTokens || 0), 0);
-  const cacheReusePercent = observedInputTokens > 0
-    ? Math.min(100, (cachedInputTokens / observedInputTokens) * 100)
-    : null;
   const estimatedInputEvents = events.filter((event) =>
     Number.isFinite(Number(event.estimatedInputTokens)),
   ).length;
@@ -412,11 +411,6 @@ export function StatusPage({
                   <dt>{t("status.context.inputObserved")}</dt>
                   <dd>{compactNumber(observedInputTokens)}</dd>
                   <small>{t("status.context.acrossEvents", { count: exactNumber(events.length) })}</small>
-                </div>
-                <div>
-                  <dt>{t("status.context.reuseShare")}</dt>
-                  <dd>{cacheReusePercent == null ? t("status.context.notMeasured") : `${cacheReusePercent.toFixed(1)}%`}</dd>
-                  <small>{t("status.context.reuseShareDesc")}</small>
                 </div>
               </dl>
               <p className="st-telemetry-note">
@@ -659,7 +653,8 @@ function StatusModelRow({ model, peak }: { model: StatusModelUsage; peak: number
   const t = useI18n();
   const total = model.totalTokens || 0;
   const width = Math.max(total > 0 ? 1.5 : 0, (total / peak) * 100);
-  const speed = Number(model.observedTokensPerSecond);
+  const speed = model.observedTokensPerSecond;
+  const outcomes = generationOutcomesSummary(model, t);
   return (
     <article className="st-model-row">
       <div className="st-model-heading">
@@ -688,7 +683,8 @@ function StatusModelRow({ model, peak }: { model: StatusModelUsage; peak: number
         <span>{t("status.model.input", { count: compactNumber(model.inputTokens || 0) })}</span>
         <span>{t("status.model.output", { count: compactNumber(model.outputTokens || 0) })}</span>
         <span>{t("status.model.requests", { count: exactNumber(model.requests || 0) })}</span>
-        {Number.isFinite(speed) ? <span>{speed.toFixed(1)} tok/s</span> : <span>{t("status.model.speedUnmeasured")}</span>}
+        {outcomes ? <span>{outcomes}</span> : null}
+        {speed != null && Number.isFinite(speed) ? <span>{speed.toFixed(1)} tok/s</span> : <span>{t("status.model.speedUnmeasured")}</span>}
         {model.speedSampleCount ? <span>{t("status.model.speedSamples", { count: exactNumber(model.speedSampleCount) })}</span> : null}
       </div>
     </article>
@@ -713,41 +709,37 @@ function StatusSummary({ items }: {
 
 function EventRow({ event }: { event: UsageEventTelemetry }) {
   const t = useI18n();
-  const success = Boolean(event.status && event.status >= 200 && event.status < 400);
-  const failure = Boolean(event.status && event.status >= 400);
-  const total = event.totalTokens ?? (
-    event.inputTokens !== undefined || event.outputTokens !== undefined
-      ? (event.inputTokens || 0) + (event.outputTokens || 0)
-      : undefined
-  );
+  const outcome = eventGenerationPresentation(event, t);
+  const total = tokenCountFromEvent(event);
   const flag = eventFlag(event, t);
   return (
-    <article>
+    <article title={outcome.detail} aria-label={outcome.detail}>
       <ProviderLogo
         providerId={event.provider || "router"}
         displayName={event.provider}
         size="small"
-        className={failure ? "st-event-logo is-failure" : success ? "st-event-logo is-success" : "st-event-logo"}
+        className={outcome.tone === "danger" ? "st-event-logo is-failure" : outcome.tone === "success" ? "st-event-logo is-success" : "st-event-logo"}
       />
       <span className="st-event-model">
         <strong>{shortModelName(event.model || t("status.model.unknown"))}</strong>
-        <small>{event.provider || t("status.routerFallback")}</small>
+        <small>{event.provider || t("status.routerFallback")} · {outcome.httpLabel}</small>
       </span>
       <span className="st-event-metering">
-        <strong>{total === undefined ? t("status.event.unmetered") : t("status.model.tok", { count: compactNumber(total) })}</strong>
+        <strong>{total === null ? t("status.event.unmetered") : t("status.model.tok", { count: compactNumber(total) })}</strong>
         <small>{event.cachedInputTokens === undefined
           ? t("status.event.noCacheDetail")
           : t("status.event.cached", { count: compactNumber(event.cachedInputTokens) })}</small>
       </span>
       <span className="st-event-duration">
         <strong>{event.durationMs ? formatDuration(event.durationMs) : t("status.event.noDuration")}</strong>
-        <small>{event.status || t("status.event.noStatus")}</small>
+        <small>{outcome.httpLabel}</small>
       </span>
       <span className="st-event-time">
         <time dateTime={dateTimeValue(event.at)}>{formatDateTime(event.at, t)}</time>
       </span>
       <span className="st-event-flag">
-        {flag ? <Badge tone={failure ? "danger" : "warning"}>{flag}</Badge> : null}
+        <Badge tone={outcome.tone}>{outcome.label}</Badge>
+        {flag ? <span title={flag}> · {flag}</span> : null}
       </span>
     </article>
   );

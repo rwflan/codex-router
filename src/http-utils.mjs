@@ -4,6 +4,9 @@ import { isDeepStrictEqual } from "node:util";
 
 import { secretEqual } from "./caller-auth.mjs";
 import { TARGET } from "./paths.mjs";
+import { responsesStreamFailure } from "./responses-stream-failure.mjs";
+
+export { markResponsesStream } from "./responses-stream-failure.mjs";
 
 // Some Responses -> Chat Completions bridges (LiteLLM's, notably) emit one
 // assistant message per Responses item, so a stored turn of
@@ -615,10 +618,11 @@ export async function readRequestBody(
 // built-in Response helpers buffer first, which lets a provider-controlled
 // error or relay response consume unbounded memory before the caller can
 // reject it. Cancellation releases the upstream stream as soon as the limit
-// is crossed.
+// is crossed. A caller reading only one tee branch can opt out of awaiting
+// cancellation: that promise also waits for the separately owned branch.
 export async function readResponseBody(
   upstream,
-  { maxBytes = MAX_BUFFERED_RESPONSE_BYTES, signal } = {},
+  { maxBytes = MAX_BUFFERED_RESPONSE_BYTES, signal, awaitCancellation = true } = {},
 ) {
   if (!upstream?.body) return Buffer.alloc(0);
   const reader = upstream.body.getReader();
@@ -636,7 +640,6 @@ export async function readResponseBody(
         : new Uint8Array(result.value || []);
       total += chunk.byteLength;
       if (total > limit) {
-        await reader.cancel().catch(() => {});
         const error = new Error(`Upstream response exceeds ${limit} bytes.`);
         error.status = 502;
         error.code = "ERR_UPSTREAM_RESPONSE_TOO_LARGE";
@@ -645,7 +648,8 @@ export async function readResponseBody(
       chunks.push(Buffer.from(chunk));
     }
   } catch (error) {
-    await reader.cancel().catch(() => {});
+    const cancellation = reader.cancel().catch(() => {});
+    if (awaitCancellation) await cancellation;
     throw error;
   } finally {
     reader.releaseLock?.();
@@ -755,52 +759,55 @@ export async function finishResponse(response) {
 // ("error decoding response body") with nothing to say about the cause. Ending
 // the body instead produces a well-formed, if short, HTTP message.
 //
-// A gracefully ended SSE stream, though, is indistinguishable from a completed
-// one: the turn would simply look short and successful. So on `text/event-stream`
-// we first emit a terminal `error` event, matching the event framing the router
-// already writes elsewhere and the Responses API's own `error` event. A parser
-// that understands it surfaces a real failure; one that does not ignores the
-// unknown event and lands on the plain graceful end, which is still strictly
-// better than a reset. The frame carries a fixed router-side message and never
-// upstream error text, so no response body can leak through it.
+// A graceful SSE end alone cannot state a turn's failure. Marked Responses
+// streams with trusted final-egress metadata get a typed `response.failed`.
+// Native Responses also permit a minimal local failure when metadata is unknown.
+// Other streams without trustworthy metadata keep the generic `error` frame.
+// Prompt clean EOF lets clients handle the failure;
+// retries still follow their policy. The message is approved router-side text,
+// never an upstream error body, so no response body can leak through it.
 //
 // The frame is prefixed with a blank line because the stream is being ended at
 // the point upstream died, which is very often mid-line: transforms forward
 // upstream's chunk boundaries verbatim, and a single `output_text.delta` can
-// carry a long span. Writing `event: error` straight onto an unterminated
+// carry a long span. Writing an `event:` field straight onto an unterminated
 // `data:` line does not produce an error event at all -- a conforming parser
 // reads the field name as more of the previous event's data, so the failure
 // signal turns into garbage appended to the last delta, which is exactly the
 // silent corruption this function exists to avoid. Leading newlines are inert
 // when the stream did end cleanly: a blank line with no buffered fields
 // dispatches nothing.
-// `message` lets a caller that diagnosed the failure say so; the code stays
-// fixed, because a diagnosed cause is more detail about this same failure and
-// not a second kind of it. The default wording holds for every caller that
-// reaches here with nothing more specific -- a guessed cause is worse than an
-// honest generic one.
-export function endStreamedResponse(response, { message } = {}) {
+// Transport failures keep their default retryable classification. A caller
+// rejecting unsafe output locally must preserve its diagnostic code and mark
+// the rejection terminal, so a client does not replay the committed generation.
+export function endStreamedResponse(response, { code = "local_router_stream_failed", message, localRejection = false } = {}) {
   if (!response || response.writableEnded || response.destroyed) return;
   writeStreamErrorEvent(response, {
-    code: "local_router_stream_failed",
+    code,
     message: message || "The local router lost the upstream response stream.",
+    localRejection,
   });
   response.end();
 }
 
-// Emit a terminal `error` event into a response whose head is already sent,
+// Emit a terminal failure into a response whose head is already sent,
 // without ending it -- the caller decides when the stream is over. Used where
 // the router has committed to a 200 and then hits a failure it must state
 // rather than let pass as a short, successful-looking turn. The framing and
 // the leading blank line are the same as `endStreamedResponse` above, and for
 // the same reasons; the message is always router-side text, never an upstream
 // body.
-export function writeStreamErrorEvent(response, { code, message }) {
+export function writeStreamErrorEvent(response, { code, message, localRejection = false }) {
   if (!response || response.writableEnded || response.destroyed) return false;
   if (!isEventStream(response)) return false;
   try {
-    const data = { type: "error", code, message, param: null };
-    response.write(`\n\nevent: error\ndata: ${JSON.stringify(data)}\n\n`);
+    const failure = responsesStreamFailure(response, { code, message, localRejection });
+    if (failure?.terminal) {
+      if (failure.closePendingFrame) response.write("\n\n");
+      return false;
+    }
+    const data = failure?.event || { type: "error", code, message, param: null };
+    response.write(`\n\nevent: ${data.type}\ndata: ${JSON.stringify(data)}\n\n`);
     return true;
   } catch {
     // The socket may already be gone; the caller ends the response anyway.
@@ -852,7 +859,8 @@ export function requireInternalAuth(request, response, secret) {
   const authorized = secretEqual(
     request.headers.authorization,
     `Bearer ${secret}`,
-  ) || secretEqual(request.headers["x-api-key"], secret);
+  ) || secretEqual(request.headers["x-api-key"], secret)
+    || secretEqual(request.headers["x-goog-api-key"], secret);
   if (!authorized) {
     writeJson(response, 401, {
       error: {

@@ -72,7 +72,7 @@ export interface SubagentSettings {
   enabled: string[];
   disabled: string[];
   efforts?: Record<string, string>;
-  /** Machine-local v2 capability evidence, populated by the live probe. */
+  /** Machine-local diagnostics; these never grant subagent capabilities. */
   proofs?: Record<string, {
     status: "checking" | "candidate" | "experimental" | "proven" | "failed" | string;
     reason?: string;
@@ -484,7 +484,16 @@ export interface AccountUsage {
   };
 }
 
-export interface ProviderModelUsage {
+export type GenerationOutcome = "completed" | "failed" | "incomplete" | "canceled" | "indeterminate";
+
+export interface GenerationOutcomeStats {
+  outcomeCounts?: Partial<Record<GenerationOutcome, number>>;
+  /** Requests recorded before generation outcomes were available. */
+  legacyOutcomeRequests?: number;
+  requests?: number;
+}
+
+export interface ProviderModelUsage extends GenerationOutcomeStats {
   slug?: string;
   displayName?: string;
   inputTokens?: number;
@@ -498,7 +507,7 @@ export interface ProviderModelUsage {
   lastUsedAt?: string;
 }
 
-export interface ProviderUsage {
+export interface ProviderUsage extends GenerationOutcomeStats {
   id: string;
   displayName: string;
   credentialType?: string;
@@ -570,6 +579,9 @@ export interface UsageEvent {
   model?: string;
   provider?: string;
   status?: number;
+  /** HTTP delivery status is separate from the terminal generation result. */
+  httpStatus?: number;
+  generationOutcome?: GenerationOutcome;
   durationMs?: number;
   /** Milliseconds until the upstream response headers arrived. */
   responseStartMs?: number;
@@ -692,7 +704,6 @@ export interface HarnessDescriptor {
     | "nousresearch";
   description: string;
   cliInstalled: boolean;
-  cliVersion?: string;
   appInstalled: boolean;
   configured: boolean;
   canInstall: boolean;
@@ -781,6 +792,52 @@ export interface ContextSessionsSnapshot {
   };
 }
 
+export interface FreePoolMember {
+  position: number;
+  slug: string;
+  upstreamModel: string;
+  lane: "kilo" | "opencode";
+  self: boolean;
+  enabled: boolean;
+  contextWindow?: number;
+  drained: boolean;
+  drainedUntil?: string;
+  drainReason?: string;
+  drainStatus?: number;
+  remainingMs?: number;
+}
+
+export interface FreePoolUsageRow {
+  at: string;
+  model: string;
+  status?: number;
+  failoverFrom?: string;
+  reason?: string;
+  inputTokens: number;
+  outputTokens: number;
+  requestId?: string;
+}
+
+export interface FreePoolStatus {
+  pool: string;
+  available: boolean;
+  enabled?: boolean;
+  catalog: { source: "live" | "static"; fetchedAt?: string; kilo: number; opencode: number };
+  members: FreePoolMember[];
+  usage: {
+    requests: number;
+    attempts: number;
+    served: number;
+    errors: number;
+    fallbacks: number;
+    exhausted: number;
+    inputTokens: number;
+    outputTokens: number;
+    byMember: Array<{ model: string; requests: number; served: number; failed: number; inputTokens: number; outputTokens: number }>;
+    recent: FreePoolUsageRow[];
+  };
+}
+
 export interface RouterControlApi {
   setInterfaceLanguage?(language: import("./i18n").LanguageId): void;
   readonly platform: string;
@@ -795,6 +852,7 @@ export interface RouterControlApi {
   discoverProviderModels(provider: string, options?: { refresh?: boolean }): Promise<ProviderCatalog>;
   getAccountUsage(): Promise<AccountUsage>;
   getProviderUsage(): Promise<ProviderUsageSnapshot>;
+  getFreePool?(): Promise<FreePoolStatus>;
   getLocalModels(): Promise<LocalModelsSnapshot>;
   getVisionBridge(): Promise<VisionBridgeSnapshot>;
   getToolResultAging(): Promise<ToolResultAgingSnapshot>;
@@ -819,17 +877,6 @@ export interface RouterControlApi {
   setSubagentMode(mode: "all" | "selected" | "proven"): Promise<unknown>;
   setSubagentModel(slug: string, enabled: boolean): Promise<unknown>;
   setSubagentEffort(slug: string, effort: string): Promise<unknown>;
-  /** Runs the five live checks for each route in parallel; a complete pass promotes that route here. */
-  certifySubagentModels(slugs: string[]): Promise<{
-    results?: Array<{
-      slug: string;
-      certified?: boolean;
-      /** The run never reached a verdict: rate limit, outage, or a harness refusal. */
-      deferred?: boolean;
-      failedLabel?: string;
-      reason?: string;
-    }>;
-  }>;
   setSubagentSelection(selectAll: boolean): Promise<unknown>;
   setPickerModel(slug: string, visible: boolean): Promise<unknown>;
   setPickerModels(showAll: boolean): Promise<unknown>;
@@ -874,7 +921,7 @@ export interface RouterControlApi {
   openHarnessSession(harnessId: HarnessId, sessionId: string, surface: HarnessSurface, model?: string): Promise<unknown>;
   openExternal(url: string): Promise<void>;
   onNavigation?(listener: (request: {
-    destination: "usage" | "usage-resets";
+    destination: "usage" | "usage-resets" | "settings";
     sourceId?: string;
   }) => void): () => void;
   onOperation?(listener: (event: OperationEvent) => void): () => void;

@@ -92,7 +92,7 @@ user.
    shares its stored key and is enabled and disabled with it automatically;
    never select or toggle it separately. Command Code uses its stored or
    environment API key; it has no router-managed CLI sign-in path. The
-   catalog-only providers `groq`, `together`, `fireworks`,
+   catalog-only providers `aimlapi`, `atlascloud`, `groq`, `together`, `fireworks`,
    `cerebras`, `mistral`, `nvidia-nim`, `siliconflow`, `huggingface`,
    `gemini-api`, `github-copilot`, `chutes`, `orca`, and `vertex` are also selectable, but they ship no
    preselected models: after
@@ -644,6 +644,10 @@ The service definition still looked correct at every glance.
    That keeps caller-capability rotation/recovery from swapping generations
    underneath an unmanaged foreground router. Direct `src/start.mjs` remains the
    OS-service payload; do not route the managed service through the lifetime lock.
+   Being unmanaged, the foreground supervisor never claims the Windows
+   service-process record: `src/foreground-start.mjs` calls
+   `markForegroundSupervisor()` before it imports `src/start.mjs`, because that
+   record only accepts a command line that names `src/start.mjs`.
 3. **A silent environment adopts the recorded proxy.**
    `inheritedProxyEnvironment()` in `src/proxy-environment.mjs` reads the
    install manifest, and `src/start.mjs` applies it to `process.env` before it
@@ -661,7 +665,8 @@ The service definition still looked correct at every glance.
    normal start reaches the managed service layer, Windows matches POSIX, and
    explicit foreground startup cannot boot while another service lifecycle
    operation owns the shared lock. The same file keeps the silent-environment
-   proxy restore regression.
+   proxy restore regression. `test/startup-cleanup.test.mjs` boots the
+   foreground entry past the Windows service-process record.
 
 ## The gateway is restarted in place; the router is not taken down with it
 
@@ -733,19 +738,33 @@ and every client saw a bare "Connection error" naming nothing.
    wheel-availability floor. `scripts/verify-zai-litellm-usage.mjs` exercises
    the pinned LiteLLM bridge with synthetic authoritative usage on every Python
    lock job.
-9. **Z.ai Responses streams need a post-LiteLLM message-envelope repair.**
-   Live GLM-5.3 traffic through LiteLLM 1.96 can finish a reasoning item and
-   then emit `response.output_text.delta` for the assistant message without the
-   required `response.output_item.added` / `response.content_part.added`
-   envelope. The same malformed stream can reuse reasoning's `output_index=0`
-   for the message and close the message with a `reasoning_text` content part.
-   `src/zai-responses-compat.mjs` repairs only that Z.ai event-stream shape
-   after LiteLLM translation: valid streams remain byte-identical, native
-   OpenAI traffic is never attached to the transform, and provider reasoning
-   must never be copied into assistant-visible message content. A real Codex
-   live probe is the regression oracle: no `OutputTextDelta without active
-   item` warnings and the message occupies the next output index after
-   reasoning.
+9. **Chat Completions Responses streams need a post-LiteLLM message-envelope
+   repair.** When the first upstream chunk carries reasoning, LiteLLM 1.96
+   finishes a reasoning item and then emits `response.output_text.delta` for
+   the assistant message without the required `response.output_item.added` /
+   `response.content_part.added` envelope. It reuses the reasoning item's
+   `output_index=0` for the message and closes it with a `reasoning_text`
+   content part. In a tool turn it also closes an empty message that it never
+   opened, after the function call. First seen on Z.ai GLM-5.3. It was
+   reproduced live on OpenRouter (`mimo-v2.6-flash`,
+   `stealth/space-bunny-alpha`, 2026-09-24) and offline against the pinned
+   LiteLLM with a synthetic upstream, so the shape comes from the bridge and
+   not from any one provider.
+   `messageEnvelopeCompatTransform` in `src/zai-responses-compat.mjs` therefore
+   attaches to every `protocol: "openai"` (default) route. Exclusions: direct
+   DeepSeek, which has its own bridge repair; `openai-responses` providers,
+   which skip the bridge; and native traffic. Anthropic Messages routes are
+   excluded too, because they arrive message-first and no capture shows this
+   shape there, so widening to them needs one. Rules: an unchanged block is
+   relayed as the exact bytes that arrived. A frame that is not valid UTF-8
+   switches the stage off for the rest of the response. Content parts of an
+   item opened as something other than a message are never adopted. Provider
+   reasoning must never be copied into assistant-visible message content. The
+   regression oracle is a real Codex live probe: no `OutputTextDelta without
+   active item` errors, and the message takes the next output index after the
+   reasoning item. The router case is "router gives OpenRouter Chat
+   Completions text a message envelope after reasoning" in
+   `test/routing.test.mjs`.
 10. **LiteLLM custom-tool streaming uses a mixed lifecycle.** LiteLLM 1.96
    converts Responses `type: "custom"` tools into Chat Completions functions
    whose one required string property is `content`. On the return stream it can
@@ -776,6 +795,39 @@ and every client saw a bare "Connection error" naming nothing.
    loop, the bound, the window, the backoff) and `test/gateway-restart.test.mjs`
    (end to end: a stand-in gateway exits 1 mid-request, the service does not,
    and the router is still serving afterwards).
+
+## The router port opens before the gateway is healthy
+
+`src/start.mjs` used to spawn the router only after LiteLLM passed its health
+check, so every service restart closed the client-facing port for the whole cold
+start. Codex's own retries ran out inside that window and it reported
+`stream disconnected before completion: Connection refused`.
+
+1. **The router is spawned with the forwarders, before any dependency wait.**
+   Do not move it back behind the gateway to simplify startup; that reintroduces
+   the outage on every restart.
+2. **`ready` still means the whole stack is healthy.** The router's `/health`
+   answers 503 with `degraded` until its dependencies are reachable, so startup,
+   Antigravity promotion, and `waitForRouterHealth` keep their meaning. An open
+   port is not readiness.
+3. **A router that dies during startup ends startup at once.** The dependency
+   waits do not watch it, so they race its exit. Without that, a router that
+   cannot bind leaves the service waiting out the gateway's allowance.
+4. **Native turns are never held, and a routed request waits only for what its
+   route uses.** Routed requests wait in `src/startup-dependency-gate.mjs` for
+   the services `routeExecution` names, so a direct Responses provider never
+   waits on LiteLLM. Embeddings and decisions wait for the API forwarder they
+   call. The gate is off unless the supervisor sets
+   `CODEX_ROUTER_STARTUP_HOLD_MS`, because a router started on its own has
+   nothing bringing those dependencies up.
+5. **The gate covers startup only.** Each dependency latches open on its first
+   healthy probe or when the bound runs out, and never closes again. A caller
+   must recheck its abort signal after the wait. A later gateway crash
+   belongs to the gateway supervisor. Do not reuse the gate to ride out crashes:
+   Codex retries on its own and the holds would multiply.
+6. **Coverage.** `test/startup-restart-gap.test.mjs` drives the real `start.mjs`
+   against a stand-in gateway whose cold start the test controls, and
+   `test/startup-dependency-gate.test.mjs` holds the gate's contract.
 
 ## Requests to install or expose more models
 
@@ -900,23 +952,23 @@ so the unit of evidence is always the slug, never the model name.
    failure, and a stale `checking` record is retryable. Explicit registry-v1
    routes are settled decisions and are never re-opened by this local probe;
    registry-v2 routes need no compatibility probe.
-2. `multi-agent-proofs.json` is diagnostic application evidence only. Local
-   `candidate`, and legacy `experimental` / `proven`, records cannot change the
-   catalog's `multi_agent_version`, managed agent definitions, or any client
-   route. `applySubagentProofs` deliberately returns the registry capabilities
-   unchanged. An unreadable proofs file therefore authorizes and promotes
-   nothing.
+2. `multi-agent-proofs.json` is diagnostic history only. Local records,
+   including `candidate`, `experimental`, `proven`, and historical `verified`,
+   never grant or revoke subagent capabilities. Publication uses registry
+   capabilities and explicit operator selection through
+   `applyMultiAgentCapabilities`; unreadable diagnostic history changes
+   neither.
 3. The compatibility probe is not the native collaboration proof. It does not
    exercise Codex's encrypted child payload relay, a marker-return spawn, or a
    same-thread follow-up. A successful ordinary chat/tool request must never be
    presented as evidence that the model can hold the native v2 child role.
-4. Only the exact checked-in registry route may assert v2. The route's slug,
-   provider, and upstream model must match an accepted artifact under
-   `v2_agent/`, and the accepted artifact and `multiAgentVersion: "v2"` change
-   land in the same pull request. CI enforces the implication in both
-   directions for every post-workflow promotion. Six exact Kimi/Grok route
-   identities certified before the artifact gate are grandfathered; changing
-   any part of one identity loses that exception.
+4. Only the exact checked-in registry route may assert shipped v2
+   certification. The route's slug, provider, and upstream model must match an
+   accepted artifact under `v2_agent/`, and the accepted artifact and
+   `multiAgentVersion: "v2"` change land in the same pull request. CI enforces
+   the implication in both directions for every post-workflow promotion.
+   Six exact Kimi/Grok route identities certified before the artifact gate
+   are grandfathered; changing any part of one identity loses that exception.
 5. `control subagents verify [SLUG ...]` re-researches explicitly (foreground,
    about two requests per unknown candidate); with no slugs it sweeps the
    enabled list. Select-all and mode changes never trigger probes. Provider,
@@ -966,16 +1018,14 @@ so the unit of evidence is always the slug, never the model name.
    Codex collaboration: tool calls work, encrypted subagent payload relay works
    without disclosure, a marker-return spawn succeeds, and a same-thread
    follow-up succeeds. Otherwise omit it and retain conservative v1 behavior.
-   The registry is not the only way a route reaches v2. The operator's own
-   selection promotes it — `subagents mode selected` plus `subagents set <slug>
-   on`, or `mode all` — and so does a completed local verification of all five
-   checks recorded in `multi-agent-proofs.json`. Selection is the ordinary path
-   and the one the Control Center switch uses; the registry exists so nobody
-   has to select a proven route by hand. None of this loosens the gate: an
-   explicit `off` beats every mode, a hidden model is never promoted, a partial
-   verification or a mismatched slug promotes nothing, the legacy diagnostic
-   statuses promote nothing, and only the pull request that moves the registry
-   entry may accept a `v2_agent/` application. Read
+   The operator's own selection can also offer a route as v2 — `subagents mode
+   selected` plus `subagents set <slug> on`, or `mode all`. Selection is intent,
+   not certification, and is the ordinary path the Control Center switch uses.
+   The registry exists so nobody has to select a proven route by hand. An
+   explicit `off` beats every mode and a hidden model is never promoted. Local
+   diagnostic records, including historical `verified` records, never grant or
+   revoke this role. Only the pull request that moves the registry entry may
+   accept a `v2_agent/` application. Read
    `docs/SUBAGENT-CERTIFICATION.md` in full before changing
    `src/subagent-*.mjs`, `src/multi-agent-state.mjs`, `v2_agent/`, or the
    Subagents column — it records which questions have already been answered at
@@ -1407,6 +1457,37 @@ curation never takes a model out of a user's configuration.
 Do not try to get past that gate. The restriction is the provider's access
 policy, stated in its own error, so reproducing whatever identifies OpenCode's
 client would be circumventing it rather than fixing a compatibility problem.
+
+## `free/auto` is one picker entry over a pool of anonymous free models
+
+`config/free/auto.json` publishes exactly one listed model, `free/auto`. Its
+members are generated at registry load by `withFreePoolMembers`
+(`src/model-registry.mjs`) from `src/free-pool-catalog.mjs`. They are unlisted,
+so they must never reach the picker, `/v1/models`, Cursor, DSH or Gemini
+publication. `test/free-pool-router.test.mjs` asserts this.
+
+- **Endpoints.** Members use only the two documented anonymous endpoints
+  pinned in `ANONYMOUS_ENDPOINTS`: Kilo's `:free` gateway and the OpenCode Zen
+  free lane. Do not add a member that needs a key, a borrowed credential, a
+  spoofed client header, or anything else that identifies as another product.
+  OpenCode ids in `OPENCODE_FREE_CLIENT_GATED` or `OPENCODE_FREE_WITHDRAWN` are
+  filtered out of the lane by `openCodeFreeIdRefused`.
+- **Walking the pool.** `src/router.mjs` walks the members under the same rule
+  as model failover: only before the first relayed byte. A member that streamed
+  text keeps the turn. `classifyFreePoolFailure` in `src/free-pool.mjs` decides
+  whether a failure moves the turn on and for how long it drains. An ordinary
+  400 is returned as it is.
+- **Drains.** Drains live in `free-pool-drains.json`, never in
+  `provider-cooldowns.json`. A drained free member must not cool down the
+  user's own `kilo-free` or `opencode-free` routes.
+- **Refresh.** `./bin/control free-pool refresh` and the daily start-up refresh
+  run only once `free` is explicitly enabled and
+  `MODEL_ROUTER_FREE_POOL_REFRESH` is not `0`, so tests make no network calls.
+  A refresh that fails for one lane keeps that lane's last good list.
+- **Usage.** Usage rows carry `freePool` and `freePoolReason` through
+  `usageDiagnosticMetadata`. The Control Center reads them through
+  `control free-pool status` (the `getFreePool` IPC) and never directly from
+  the network.
 
 ## Ox Alpha became GLM-5.3-Flash on OpenCode Go
 
@@ -1959,12 +2040,21 @@ merely failing them.
    bytes, and replaying it appends a second response to a stream the client is
    reading. `test/native-retry.test.mjs` asserts the caller received the partial
    stream exactly once.
-2. Only failures where an intermediary never obtained a response qualify: 502,
-   503, 504, Cloudflare's 520-524, and connect-level socket errors. Do not add
-   429 — it is rate limiting, its `Retry-After` is relayed, and sleeping for the
-   upstream's suggested delay is the hang the bound exists to prevent. Do not
-   add 4xx, and do not add 500, where the origin ran and a repeat risks a second
-   execution.
+2. A generation POST additionally needs positive pre-send evidence. Node's
+   exact pre-TLS `ECONNRESET` is unsent evidence, even without `syscall`, because
+   HTTP bytes cannot cross an unestablished TLS connection. Its `host` field
+   must survive diagnostics. `test/pre-tls-retry.test.mjs` exercises real direct
+   and HTTP CONNECT handshakes, request execution counts, and replay gates.
+   A generic reset,
+   missing response headers, 502/503/504, or Cloudflare 520-524 does not prove
+   the origin never executed the request. The default `at-most-once` policy
+   refuses ambiguous automatic replay; safe methods retain bounded transient
+   retries. `CODEX_ROUTER_NATIVE_RETRY_POLICY=availability` explicitly permits
+   uncertain delivery before client output. Neither policy retries 429, other
+   4xx, or origin 500. Reject native generation redirects before following one
+   can misclassify a later connect failure as unsent. Recheck delivery, abort
+   and total-budget gates after backoff and body cancellation. See
+   `docs/native-generation-retries.md` and `test/retry-delivery-boundary.test.mjs`.
 3. Keep the bound small. Codex retries roughly five times on its own and the
    two loops multiply, so the router's share (2 retries, 250ms then 750ms) has
    to keep the product a fast failure. A retry is also only *started* while the
@@ -2295,6 +2385,21 @@ retry rules on the shared path.
   (#840). Keep this policy shared
   between hops without applying direct DeepSeek sampling parameters to resellers.
   Command Code's schema-strict `/alpha/generate` fallback remains separate.
+- Grok OAuth is the Responses-native case of the same rule. xAI returns each
+  turn's reasoning as an opaque `encrypted_content` item, and grok-4.7 keeps
+  reasoning through a tool loop only when that item comes back. Without it the
+  model stops reasoning from about the third round, plans in visible text, and
+  can repeat one progress sentence for minutes (live A/B, 23 September 2026:
+  carried 24/24 steps reasoned; dropped or summary-only 0/18 from step 3). The
+  Chat hop through LiteLLM cannot carry the item, so
+  `src/grok-reasoning-carry.mjs` keeps a completed response's certified
+  reasoning items in the forwarder, keyed by the conversation and the call ID
+  of its first tool call, and `toResponsesRequest` puts them back in front of
+  the same calls. They are xAI's own bytes, never router-authored text. A miss
+  (restart, eviction, rewritten history) sends no reasoning, exactly as before;
+  failed or incomplete responses are never remembered.
+  `CODEX_ROUTER_GROK_REASONING_CARRY=0` turns it off. Coverage lives in
+  `test/grok-reasoning-carry.test.mjs`.
 
 Regression coverage lives in `test/deepseek-responses-routing.test.mjs`,
 `test/namespace-relay-custom.test.mjs`, `test/chat-reasoning.test.mjs` and the
@@ -2361,8 +2466,8 @@ xAI and Codex has its own idle limit. The router's post-prologue stall guard
    the forwarder's xAI pool from that one value. Compaction is a hop too: it is
    not streamed, so its headers arrive only after the whole generation, and it
    uses the same pool and deployment bound as a turn. A new hop on the Grok path
-   takes its bound from there. The shared Undici pool keeps its default for
-   every other provider.
+   takes its bound from there. Local Ollama uses its own pool sized from
+   MODEL_ROUTER_LOCAL_TIMEOUT; other providers keep the shared Undici default.
 2. **Codex's idle timer is fed a lifecycle event, never a comment.** Codex
    abandons a stream after five minutes without a parsed data event and sends
    the whole turn again, which bills the provider twice; an SSE comment or a
@@ -2372,9 +2477,16 @@ xAI and Codex has its own idle limit. The router's post-prologue stall guard
    never after a terminal event, and as the last pipeline stage so no router
    transform parses it. It never carries text, reasoning, or a tool item: the
    rule against router-authored transcript content stands.
-3. **Only Grok OAuth routes get either.** Other providers keep their stall bound
-   and receive no heartbeat. Widening either needs the same proof: a router test
-   that a silent stream survives, and one that another route is unchanged.
+3. **Only Grok OAuth gets the heartbeat.** Local Ollama gets long-idle
+   transport sized from its configured timeout without a heartbeat.
+   Z.ai Coding Plan (`zai-coding`) has its own post-reasoning idle deadline:
+   `CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS`, three minutes, capped at four
+   minutes so shared transport and client idle limits remain longer. Its
+   headers-only prelude and parser bounds are unchanged, and it receives no
+   heartbeat. Other providers keep their stall bound. Widening a route needs
+   a router test that a reasoning pause survives, one that another route is
+   unchanged, and cancellation and deadline coverage without replaying a
+   visible response.
 4. Coverage lives in `test/grok-stream-timeouts.test.mjs`,
    `test/responses-heartbeat.test.mjs`, `test/fetch-transport.test.mjs`, and the
    Grok cases in `test/empty-completion-router.test.mjs`.
@@ -2529,13 +2641,11 @@ every Chat Completions route (measured on `commandcode/hy4-preview` and
    `The skill is loaded. This is a single concept-sheet generation: a
    GTA-style AAA` as `final_answer`. Hold the done event until the part
    close; if its text is the thinking or a prefix of it, withhold so
-   empty-completion retries. A held done that LiteLLM then closes as
-   `output_text` is still truncated when the snapshot is a mid-clause cut
-   (`I'll use the image generation` after the 14:12 empty-completion retry).
-   Punctuated answers stay answers. A single token with no whitespace
-   (`CODEX_ROUTER_STREAM_OK`) is a finished marker, not a mid-clause cut.
-   If the stream completes without a grown done, withhold the message so
-   empty-completion retries or fails rather than succeeding.
+   empty-completion retries. Only that structural `reasoning_text` conflict
+   authorizes withholding: canonical `output_text` stays byte-identical,
+   regardless of language, punctuation, length, or whether it sounds like a
+   plan. If a structural conflict completes without a grown done, withhold
+   the message so empty-completion retries or fails rather than succeeding.
 2. **Grok's gateway-error wording stays on Grok OAuth.** Only `grok-oauth`
    replaces an untyped LiteLLM error envelope with the fixed local error. Other
    routes relay that envelope byte-identical, after closing the reasoning item

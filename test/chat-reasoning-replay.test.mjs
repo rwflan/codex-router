@@ -75,12 +75,12 @@ async function runTap(chunks) {
     tap,
     new Writable({
       write(chunk, _encoding, callback) {
-        out.push(chunk.toString("utf8"));
+        out.push(Buffer.from(chunk));
         callback();
       },
     }),
   );
-  return { seen, out: out.join("") };
+  return { seen, out: Buffer.concat(out).toString("utf8"), bytes: Buffer.concat(out) };
 }
 
 test("the tap remembers a streamed tool-call turn and forwards every byte", async () => {
@@ -100,6 +100,79 @@ test("the tap remembers a streamed tool-call turn and forwards every byte", asyn
     reasoningForToolCalls(["call_tap_1"]),
     "The user wants the file. I should read it.",
   );
+});
+
+test("the tap recognizes complete events even when the keywords arrived in an earlier chunk", async () => {
+  resetReasoningReplayCache();
+  const chunks = [
+    'data: {"choices":[{"delta":{"reasoning_content":"read ',
+    'the file"}}]}\n\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"id":"call_split"',
+    '}]}}]}\n\n',
+    'data: {"choices":[{"delta":{},"finish_reason":',
+    '"tool_calls"}]}\n\n',
+    "data: [DONE]\n\n",
+  ];
+  const { seen, out } = await runTap(chunks);
+  assert.equal(out, chunks.join(""));
+  assert.deepEqual(seen, [{ stored: 1, chars: 13, toolCallIds: ["call_split"] }]);
+  assert.equal(reasoningForToolCalls(["call_split"]), "read the file");
+});
+
+test("one-byte chunks preserve exact Unicode reasoning and tool-call ids", async () => {
+  resetReasoningReplayCache();
+  const reasoning = "Çağan için dosyayı oku. 日本語 🙂";
+  const id = "call_çağan_日本語_🙂";
+  const source = Buffer.from([
+    `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: reasoning } }] })}\r\n\r\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ id }] } }] })}\r\n\r\n`,
+    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\r\n\r\n',
+    "data: [DONE]\r\n\r\n",
+  ].join(""));
+  const { seen, bytes } = await runTap([...source].map((byte) => Buffer.from([byte])));
+  assert.deepEqual(bytes, source, "the tap changed the upstream bytes");
+  assert.deepEqual(seen, [{ stored: 1, chars: reasoning.length, toolCallIds: [id] }]);
+  assert.equal(reasoningForToolCalls([id]), reasoning);
+});
+
+test("fragmented [DONE] cannot certify reasoning without a successful finish reason", async () => {
+  resetReasoningReplayCache();
+  const chunks = [
+    'data: {"choices":[{"delta":{"reasoning_content":"first","tool_calls":[{"id":"call_first"}]}}]}\n\n',
+    "data: [DO", "NE]\n\n",
+    'data: {"choices":[{"delta":{"reasoning_content":"second","tool_calls":[{"id":"call_second"}]}}]}\n\n',
+    "data: [DONE]\n\n",
+  ];
+  const { seen, out } = await runTap(chunks);
+  assert.equal(out, chunks.join(""));
+  assert.equal(seen.length, 0);
+  assert.equal(reasoningForToolCalls(["call_first"]), undefined);
+  assert.equal(reasoningForToolCalls(["call_second"]), undefined);
+});
+
+test("invalid UTF-8 passes through without seeding replay with replacement characters", async () => {
+  resetReasoningReplayCache();
+  const source = Buffer.concat([
+    Buffer.from('data: {"choices":[{"delta":{"reasoning_content":"'),
+    Buffer.from([0xff]),
+    Buffer.from('","tool_calls":[{"id":"call_invalid_stream"}]},"finish_reason":"tool_calls"}]}\n\n'),
+  ]);
+  const { seen, bytes } = await runTap([source]);
+  assert.deepEqual(bytes, source);
+  assert.deepEqual(seen, []);
+  assert.equal(reasoningForToolCalls(["call_invalid_stream"]), undefined);
+});
+
+test("a pending turn is not cached when UTF-8 ends mid-character", async () => {
+  resetReasoningReplayCache();
+  const source = Buffer.concat([
+    Buffer.from('data: {"choices":[{"delta":{"reasoning_content":"pending thought","tool_calls":[{"id":"call_pending_utf8"}]}}]}\n\n'),
+    Buffer.from([0xc3]),
+  ]);
+  const { seen, bytes } = await runTap([source]);
+  assert.deepEqual(bytes, source);
+  assert.deepEqual(seen, []);
+  assert.equal(reasoningForToolCalls(["call_pending_utf8"]), undefined);
 });
 
 test("the tap stays silent for a turn with no tool calls", async () => {
@@ -186,4 +259,44 @@ test("a replayed turn carries the remembered reasoning and a complete turn is un
   const intact = assistant("call_r2", "original chain");
   assert.equal(intact.reasoning_content, "original chain");
   assert.equal(toolCallIdsOf(intact)[0], "call_r2");
+});
+
+
+test("reasoning replay stores the whole completed chain or nothing", async () => {
+  const event = (delta, finish_reason) => `data: ${JSON.stringify({ choices: [{ delta, finish_reason }] })}\n\n`;
+  const ids = { tool_calls: [{ id: "call_exact_chain" }] };
+  for (const [reasoning, tail, expected] of [
+    [["x".repeat(399_999), "OMITTED", "z"], "tool_calls", undefined],
+    [["pending"], undefined, undefined],
+    [["pending"], "length", undefined],
+    [["pending"], "content_filter", undefined],
+    [["pending"], "error", undefined],
+    [["x".repeat(399_999), "z"], "tool_calls", "x".repeat(399_999) + "z"],
+    [["abc", "def"], "stop", "abcdef"],
+  ]) {
+    resetReasoningReplayCache();
+    const chunks = reasoning.map((text) => event({ reasoning_content: text }));
+    chunks.push(event(ids));
+    if (tail !== undefined) chunks.push(event({}, tail));
+    chunks.push("data: [DONE]\n\n");
+    const result = await runTap(chunks);
+    assert.equal(result.out, chunks.join(""));
+    assert.ok(reasoningForToolCalls(["call_exact_chain"]) === expected, `terminal=${tail}, lengths=${reasoning.map(s=>s.length)}`);
+  }
+  resetReasoningReplayCache();
+  await runTap([event({ reasoning_content: "pending" }), 'data: {"reasoning_content":broken}\n\n', event(ids), event({}, "tool_calls")]);
+  assert.equal(reasoningForToolCalls(["call_exact_chain"]), undefined);
+});
+
+
+test("reasoning observation cannot retain more tool ids than the replay cache can hold", async () => {
+  resetReasoningReplayCache();
+  const chunks = Array.from({ length: 513 }, (_, index) => `data: ${JSON.stringify({ choices: [{ delta: {
+    reasoning_content: index ? "" : "whole reasoning",
+    tool_calls: [{ id: `call_overflow_${index}` }],
+  } }] })}\n\n`);
+  chunks.push('data: {"choices":[{"finish_reason":"tool_calls"}]}\n\n');
+  const result = await runTap(chunks);
+  assert.equal(result.out, chunks.join(""));
+  assert.equal(reasoningReplayCacheStats().entries, 0);
 });

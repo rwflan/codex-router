@@ -206,6 +206,11 @@ ensure_uv_venv() {
   fi
 }
 
+compatibility_required=$(node src/compatibility-layer-state.mjs required)
+case "$compatibility_required" in required|unused) ;; *) echo "Could not read compatibility policy." >&2; exit 1 ;; esac
+if [ "$compatibility_required" = unused ]; then
+  echo "Compatibility layer disabled; skipping Python dependencies and probes (including forced repair)."
+else
 case "$(install_step python-deps)" in
   managed) echo "Homebrew manages LiteLLM; skipping Python dependency installation." ;;
   skip) echo "LiteLLM already matches the pinned versions; skipping the Python install." ;;
@@ -246,6 +251,7 @@ case "$(install_step python-deps)" in
     fi
     ;;
 esac
+fi
 
 node src/secret.mjs ensure
 config_enabled=false
@@ -505,7 +511,9 @@ trap - EXIT HUP INT TERM
 # tools. Best effort: a skill install failure must never roll the router back.
 # It targets Codex's own user-skill directory, so a harness install skips it.
 if [ "$target" = codex ]; then
-  node src/skills-install.mjs install
+  if ! node src/skills-install.mjs install; then
+    echo "Managed Codex skills could not be refreshed; the router is installed." >&2
+  fi
 fi
 
 if [ "$target" = dsh ]; then

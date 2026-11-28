@@ -2,15 +2,21 @@ import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  fstatSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
+  openSync,
   renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
+
+import { startupTimeoutMs } from "./startup-timeout.mjs";
 
 const WINDOWS_PRIVATE_ASYNC_TIMEOUT_MS = 30_000;
 const WINDOWS_PRIVATE_ASYNC_OUTPUT_LIMIT = 64 * 1024;
@@ -96,6 +102,11 @@ function windowsPowerShellEnvironment(paths) {
       "ProgramFiles(x86)",
       "ProgramW6432",
       "USERPROFILE",
+      // Windows PowerShell caches module discovery below LOCALAPPDATA. Losing
+      // these public runtime paths redirects its cache into the working tree
+      // instead of the caller's real or isolated profile.
+      "APPDATA",
+      "LOCALAPPDATA",
     ]
       .map((name) => name.toLowerCase()),
   );
@@ -173,7 +184,10 @@ function protectPrivateFilesWin32(paths) {
       {
         env: windowsPowerShellEnvironment(list),
         stdio: ["ignore", "ignore", "pipe"],
-        timeout: 15_000,
+        // Slow hosts (VDI Task Scheduler ancestry) need a wider bound for
+        // the helper's cold start; the default is unchanged. The async
+        // request path keeps its own bound below.
+        timeout: startupTimeoutMs("CODEX_ROUTER_WINDOWS_PRIVATE_SYNC_TIMEOUT_MS", 15_000),
         // Every private write reaches this helper, including the ones a
         // Control Center status refresh performs. A console child of a GUI
         // parent gets its own window unless this is set, which is how a
@@ -256,9 +270,104 @@ export function protectPrivateFile(target) {
   return target;
 }
 
+// Callers with copy, validation or rollback requirements prepare their own
+// exclusive temporary. Keep their transaction steps while sharing the exact
+// ACL/rename boundary with ordinary private state writes.
+export function replacePrivateFile(temporary, target, {
+  protect = protectPrivateFile,
+  beforeReplace,
+  afterReplace,
+  hardenFailure = "throw",
+} = {}) {
+  if (path.resolve(path.dirname(temporary)) !== path.resolve(path.dirname(target))) {
+    throw new Error("Private file replacement requires a same-directory temporary.");
+  }
+  try {
+    protect(temporary);
+  } catch (error) {
+    if (process.platform !== "win32" || hardenFailure !== "warn") throw error;
+    console.warn(
+      `[codex-router] warning: could not harden the ACL on ${target}: ` +
+        `${error instanceof Error ? error.message : String(error)}; continuing ` +
+        "(the state directory's own ACL still applies).",
+    );
+  }
+  beforeReplace?.();
+  renameSync(temporary, target);
+  afterReplace?.();
+  // Same-directory Windows rename carries the hardened file's DACL. A custom
+  // protector may validate a path or do more than set an ACL, so preserve both
+  // of its callbacks rather than guessing that its final-path work is redundant.
+  if (process.platform !== "win32" || protect !== protectPrivateFile) protect(target);
+  return target;
+}
+
+function writeAndClosePrivateDescriptor(descriptor, contents, sync, ownership) {
+  let writeFailed = false;
+  let writeError;
+  try {
+    // Platform file IDs can exceed Number's exact integer range.
+    ownership.identity = fstatSync(descriptor, { bigint: true });
+    writeFileSync(descriptor, contents, { encoding: "utf8" });
+    if (sync) fsyncSync(descriptor);
+  } catch (error) {
+    writeFailed = true;
+    writeError = error;
+    throw error;
+  } finally {
+    try {
+      closeSync(descriptor);
+    } catch (closeError) {
+      if (!writeFailed) throw closeError;
+      try { writeError.closeError = closeError; } catch {}
+    }
+  }
+}
+
+// A path can be redirected after exclusive creation. Cleanup must match the
+// original regular file, not merely a new object reached through that name.
+export function removeOwnedPrivateTemporary(temporary, identity) {
+  let metadata;
+  try {
+    metadata = lstatSync(temporary, { bigint: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  if (!identity || !metadata.isFile() || metadata.isSymbolicLink()
+    || metadata.dev !== identity.dev || metadata.ino !== identity.ino) {
+    throw Object.assign(new Error("The private temporary changed before cleanup; preserving it."), { code: "ESTALE" });
+  }
+  unlinkSync(temporary);
+  return true;
+}
+
+function cleanupOwnedTemporary(temporary, error, identity) {
+  try {
+    removeOwnedPrivateTemporary(temporary, identity);
+  } catch (cleanupError) {
+    if (cleanupError?.code !== "ENOENT") {
+      try { error.cleanupError = cleanupError; } catch {}
+    }
+  }
+}
+
 // All private JSON state uses the same temp-file, owner-only, atomic replace.
 // Keeping it here prevents one state writer from drifting away from the rest.
-export function writePrivateFile(target, contents, { directoryMode } = {}) {
+//
+// `hardenFailure: "warn"` is for a caller whose write must survive a PowerShell
+// that cannot start. It is not a general relaxation: the default stays "throw",
+// and only service-process.json opts in. That record is a PID, an identity
+// string, paths and ports -- no credential -- and it lives in a state directory
+// whose own ACL already applies, so a cold-host ACL timeout should cost the
+// file its extra hardening rather than cost the router its startup.
+export function writePrivateFile(target, contents, {
+  directoryMode,
+  fsync = false,
+  hardenFailure = "throw",
+  protect,
+  beforeReplace,
+} = {}) {
   const directory = path.dirname(target);
   const createdDirectory = mkdirSync(directory, { recursive: true, mode: 0o700 });
   // A caller may inject a credential path for an isolated test, but it never
@@ -268,28 +377,16 @@ export function writePrivateFile(target, contents, { directoryMode } = {}) {
     chmodSync(directory, directoryMode);
   }
   const temporary = `${target}.tmp.${process.pid}.${randomBytes(8).toString("hex")}`;
+  const ownership = { created: false };
   try {
-    writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    if (process.platform === "win32") {
-      // One spawn hardens the temporary; the renameSync below then moves this
-      // exact file over the target, and MoveFile carries the source's DACL
-      // with it, so the destination inherits the same owner-only ACL without a
-      // second PowerShell cold start. A pre-existing target that is being
-      // replaced is discarded with the move, so it cannot leak permissions.
-      protectPrivateFilesWin32([temporary]);
-      renameSync(temporary, target);
-    } else {
-      protectPrivateFile(temporary);
-      renameSync(temporary, target);
-      protectPrivateFile(target);
-    }
+    const descriptor = openSync(temporary, "wx", 0o600);
+    ownership.created = true;
+    writeAndClosePrivateDescriptor(descriptor, contents, fsync, ownership);
+    replacePrivateFile(temporary, target, { hardenFailure, protect, beforeReplace });
   } catch (error) {
-    try {
-      const metadata = lstatSync(temporary);
-      if (metadata.isFile() && !metadata.isSymbolicLink()) unlinkSync(temporary);
-    } catch {
-      // The exclusive temporary was never created or was already moved.
-    }
+    // An exclusive-create collision belongs to somebody else. Only a
+    // successful open gives this writer permission to remove the temporary.
+    if (ownership.created) cleanupOwnedTemporary(temporary, error, ownership.identity);
     throw error;
   }
   return target;
@@ -305,19 +402,22 @@ export async function writePrivateFileAsync(target, contents, { directoryMode } 
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   if (directoryMode !== undefined) chmodSync(directory, directoryMode);
   const temporary = `${target}.tmp.${process.pid}.${randomBytes(8).toString("hex")}`;
+  const ownership = { created: false };
   try {
-    writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
+    const descriptor = openSync(temporary, "wx", 0o600);
+    ownership.created = true;
+    writeAndClosePrivateDescriptor(descriptor, contents, false, ownership);
     await protectPrivateFilesWin32Async([temporary]);
     renameSync(temporary, target);
   } catch (error) {
-    if (existsSync(temporary)) unlinkSync(temporary);
+    if (ownership.created) cleanupOwnedTemporary(temporary, error, ownership.identity);
     throw error;
   }
   return target;
 }
 
-export function writePrivateJson(target, value, { space = 2, directoryMode } = {}) {
-  writePrivateFile(target, `${JSON.stringify(value, null, space)}\n`, { directoryMode });
+export function writePrivateJson(target, value, { space = 2, directoryMode, hardenFailure = "throw" } = {}) {
+  writePrivateFile(target, `${JSON.stringify(value, null, space)}\n`, { directoryMode, hardenFailure });
   return value;
 }
 

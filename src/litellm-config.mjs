@@ -1,26 +1,36 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { protectPrivateFile } from "./file-security.mjs";
+import { writePrivateFile } from "./file-security.mjs";
 import { grokGatewayStreamTimeoutSeconds } from "./grok-stream-timeouts.mjs";
+import { localTimeoutSeconds } from "./local-timeouts.mjs";
 import { LITELLM_CONFIG_PATH } from "./paths.mjs";
-import { MODELS, providerForModel } from "./model-registry.mjs";
+import { COMPATIBILITY_LAYER, MODELS, providerForModel } from "./model-registry.mjs";
+import { isOpenCodeGeminiModel } from "./opencode-gemini.mjs";
 import { assertStateOwnership } from "./state-owner.mjs";
 import { vertexAdapterForModel } from "./vertex-adapters.mjs";
 
-// Big enough for real Codex turns, small enough that a small model stays
-// entirely on the GPU of a 16 GB machine.
-const LOCAL_NUM_CTX = 16384;
+function positiveIntegerEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  if (!/^[0-9]+$/.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) < 1) {
+    throw new Error(name + " must be a positive integer; received " + JSON.stringify(raw));
+  }
+  return Number(raw);
+}
 
 function yamlString(value) {
   return JSON.stringify(String(value));
 }
 
 export function renderLiteLlmConfig() {
+  const localNumCtx = positiveIntegerEnv("MODEL_ROUTER_LOCAL_NUM_CTX", 16384);
+  const localTimeout = localTimeoutSeconds();
   const lines = ["model_list:"];
   for (const model of MODELS) {
     const provider = providerForModel(model);
+    const openCodeGemini = isOpenCodeGeminiModel(model);
     const vertexAdapter = vertexAdapterForModel(model, provider);
     // A local model is routed with Ollama's own protocol rather than its
     // OpenAI-compatible surface, purely so `num_ctx` can be set. That surface
@@ -35,7 +45,9 @@ export function renderLiteLlmConfig() {
         "    litellm_params:",
         `      model: ${yamlString(`ollama_chat/${model.upstreamModel}`)}`,
         `      api_base: ${yamlString(`os.environ/${provider.baseUrlEnv}_ROOT`)}`,
-        `      num_ctx: ${LOCAL_NUM_CTX}`,
+        `      num_ctx: ${localNumCtx}`,
+        `      timeout: ${localTimeout}`,
+        `      stream_timeout: ${localTimeout}`,
         // LiteLLM defaults to two router retries and currently maps Ollama's
         // deterministic context-window rejection to APIConnectionError. That
         // makes one prompt hit the local runtime three times before Codex sees
@@ -54,7 +66,11 @@ export function renderLiteLlmConfig() {
         ? "CODEX_ROUTER_ANTHROPIC_FORWARD_BASE_URL"
         : "CODEX_ROUTER_API_FORWARD_BASE_URL");
     const translatedModel =
-      provider.kind === "oauth" ? model.upstreamModel : model.gatewayModel;
+      openCodeGemini
+        ? `gemini/${model.upstreamModel}`
+        : provider.kind === "oauth"
+          ? model.upstreamModel
+          : model.gatewayModel;
     const protocol = vertexAdapter?.liteLlmProtocol ||
       (provider.protocol === "anthropic" ? "anthropic" : "openai");
     const responsesSurface = provider.protocol === "openai-responses";
@@ -62,7 +78,9 @@ export function renderLiteLlmConfig() {
       `  - model_name: ${yamlString(model.gatewayModel)}`,
       "    litellm_params:",
       `      model: ${yamlString(
-        `${protocol}/${responsesSurface ? "responses/" : ""}${translatedModel}`,
+        openCodeGemini
+          ? translatedModel
+          : `${protocol}/${responsesSurface ? "responses/" : ""}${translatedModel}`,
       )}`,
       `      api_base: ${yamlString(`os.environ/${apiBaseEnv}`)}`,
       '      api_key: "os.environ/CODEX_ROUTER_INTERNAL_KEY"',
@@ -78,12 +96,20 @@ export function renderLiteLlmConfig() {
             `      timeout: ${grokGatewayStreamTimeoutSeconds()}`,
           ]
         : []),
+      // Cline's non-streaming endpoint can answer HTTP 200 and still declare
+      // the result unsuccessful; the API forwarder reports that as a 500.
+      // LiteLLM retries every status of 500 and above twice, so without this
+      // one prompt would reach Cline three times for a result the origin
+      // already produced. Its retry policy has no per-status knob for 5xx, so
+      // the deployment is single-shot, like the local ones above. Codex owns
+      // its own retry policy for transient failures.
+      ...(model.provider === "clinepass" ? ["      num_retries: 0"] : []),
       "",
     );
   }
   lines.push(
     "litellm_settings:",
-    "  callbacks: [grok_service_tier_callback.grok_service_tier_callback]",
+    "  callbacks: [grok_service_tier_callback.grok_service_tier_callback, litellm_stream_cleanup_callback.stream_cleanup_callback]",
     "  drop_params: true",
     "  request_timeout: 600",
     "",
@@ -97,11 +123,18 @@ export function renderLiteLlmConfig() {
     "  disable_cooldowns: true",
     // Z.ai Coding Plan reports a five-hour account quota as HTTP 429. LiteLLM
     // otherwise retries that same exhausted plan twice before the outer router
-    // can inspect the provider body and classify it as out_of_usage. Scope the
-    // override to Coding Plan model groups only: pay-per-token Z.ai and every
-    // other provider retain LiteLLM's normal transient rate-limit behavior.
+    // can inspect the provider body and classify it as out_of_usage. Azure
+    // TPM rate-limits behave the same way on this stack: the same deployment
+    // is the only target, a mid-stream 429 closes the SSE without
+    // response.completed (Codex reports "stream closed before
+    // response.completed" and retries up to 5x), and each LiteLLM retry
+    // re-sends the full (often ~180k cached) context while TPM is exhausted.
+    // Scope the override to Coding Plan and azure-kmamc model groups only:
+    // pay-per-token Z.ai and every other provider retain LiteLLM's normal
+    // transient rate-limit behavior. Codex owns its own retry policy, so the
+    // gateway stays single-shot on rate-limits for these groups.
     "  model_group_retry_policy:",
-    ...MODELS.filter(({ provider }) => provider === "zai-coding").flatMap((model) => [
+    ...MODELS.filter(({ provider }) => provider === "zai-coding" || provider === "azure-kmamc").flatMap((model) => [
       `    ${model.gatewayModel}:`,
       "      RateLimitErrorRetries: 0",
     ]),
@@ -114,25 +147,19 @@ export function renderLiteLlmConfig() {
 }
 
 export function writeLiteLlmConfig(target = LITELLM_CONFIG_PATH) {
+  if (!COMPATIBILITY_LAYER.enabled) return undefined;
   // Only guard the managed path. Tests and tooling that render to an explicit
   // temporary file are not touching the live gateway config.
   if (target === LITELLM_CONFIG_PATH) {
     assertStateOwnership("write the gateway routing config");
   }
-  mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  // LiteLLM resolves configured callbacks beside its YAML. Publish only this
-  // repository-owned module, atomically and privately, before referencing it.
-  const callbackPath = path.join(path.dirname(target), "grok_service_tier_callback.py");
-  const callbackTemp = `${callbackPath}.tmp.${process.pid}`;
-  writeFileSync(callbackTemp, readFileSync(new URL("./grok_service_tier_callback.py", import.meta.url)), { mode: 0o600 });
-  protectPrivateFile(callbackTemp);
-  renameSync(callbackTemp, callbackPath);
-  protectPrivateFile(callbackPath);
-  const temporary = `${target}.tmp.${process.pid}`;
-  writeFileSync(temporary, renderLiteLlmConfig(), { encoding: "utf8", mode: 0o600 });
-  protectPrivateFile(temporary);
-  renameSync(temporary, target);
-  protectPrivateFile(target);
+  // LiteLLM resolves configured callbacks beside its YAML. Publish only these
+  // repository-owned modules, atomically and privately, before referencing them.
+  for (const name of ["grok_service_tier_callback.py", "litellm_stream_cleanup_callback.py"]) {
+    const callbackPath = path.join(path.dirname(target), name);
+    writePrivateFile(callbackPath, readFileSync(new URL(`./${name}`, import.meta.url)));
+  }
+  writePrivateFile(target, renderLiteLlmConfig());
   return target;
 }
 

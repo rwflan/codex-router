@@ -1,0 +1,1 @@
+- **No visible LiteLLM window on Windows, and clearer upstream errors.** The gateway child now starts hidden even when the supervisor has no console, so closing a stray window no longer brings it back. Upstream errors that carry only a `detail` field or a short plain-text body now pass that text through as the message.

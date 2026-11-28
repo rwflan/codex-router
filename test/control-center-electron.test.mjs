@@ -57,12 +57,65 @@ import {
 
 import { LANGUAGE_OPTIONS, messageCatalogs } from "../apps/control-center/src/i18n.ts";
 
-test("ChatGPT browser login reports a terminal retry after child close without auth", async () => {
+test("harness detection does not launch version commands for installed clients", async () => {
+  const source = await readFile(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("export function getHarnessSnapshot()");
+  const end = source.indexOf("\nfunction shellQuote(", start);
+  assert.ok(start >= 0 && end > start);
+  let versionCommands = 0;
+  const snapshot = vm.runInNewContext(
+    `${source.slice(start, end).replace(/^export /, "")}\ngetHarnessSnapshot();`,
+    {
+      path: path.posix,
+      os: { homedir: () => "/fixture" },
+      process: { env: {}, platform: "darwin" },
+      executablePath: (name) => `/fixture/bin/${name}`,
+      executableVersion: () => { versionCommands += 1; return "1.0"; },
+      openclawDesktopPath: () => undefined,
+      cursorDesktopPath: () => undefined,
+      codexDesktopPath: () => undefined,
+      routerStateDirectory: () => "/fixture/state",
+      readBounded: () => "",
+      readJsonObject: () => undefined,
+      existsSync: () => false,
+      terminalAvailable: () => true,
+      OPENCLAW_DOCS: "", CODEX_DOCS: "", DSH_DOCS: "",
+      CLAUDE_CODE_DOCS: "", GEMINI_CLI_DOCS: "", CURSOR_DOCS: "",
+      ROUTED_HARNESS_ROWS: Array.from({ length: 5 }, (_, index) => ({
+        id: `client-${index}`, executables: [`client-${index}`], marker: "marker",
+      })),
+    },
+  );
+  assert.equal(snapshot.harnesses.length, 11);
+  assert.ok(snapshot.harnesses.every((harness) => harness.cliInstalled));
+  assert.equal(versionCommands, 0);
+});
+
+test("desktop executable lookup preserves dispatcher names and the core Codex choice", async () => {
+  const source = await readFile(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("function executablePath(name)");
+  const end = source.indexOf("\nfunction codexDesktopPath", start);
+  assert.ok(start >= 0 && end > start);
+  const resolve = vm.runInNewContext(`${source.slice(start, end)}\nexecutablePath`, {
+    path: path.posix, process: { platform: "linux", env: { PATH: "/fixture/bin" } },
+    os: { homedir: () => "/fixture/home" }, fsConstants: { X_OK: 1 },
+    accessSync() {}, statSync: () => ({ isFile: () => true }),
+    realpathSync: () => "/fixture/volta-shim",
+    findCodexBinary: () => "/fixture/desktop-bundle/codex",
+  });
+  assert.equal(resolve("node"), "/fixture/bin/node");
+  assert.equal(resolve("codex"), "/fixture/desktop-bundle/codex");
+  const packaged = "file:///app/Resources/app.asar/electron/ipc.mjs";
+  assert.equal(new URL("../../router-src/codex-binary.mjs", packaged).pathname,
+    "/app/Resources/router-src/codex-binary.mjs");
+});
+
+test("ChatGPT browser login reports a terminal retry after child close without auth", { timeout: 10_000 }, async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "router-browser-login-"));
   const windows = process.platform === "win32";
   const executable = path.join(directory, windows ? "codex-test.cmd" : "codex-test");
   const openedUrls = [];
-  let exited = false;
+  const finished = Promise.withResolvers();
   const accountId = "acct_example_123456";
   const attempts = new Map([[accountId, { status: "pending", deadlineAt: Date.now() + 60_000 }]]);
   try {
@@ -77,14 +130,13 @@ test("ChatGPT browser login reports a terminal retry after child close without a
       environment: { PATH: windows ? process.env.PATH || "" : "/usr/bin:/bin:/usr/sbin:/sbin" },
       openExternal: async (url) => { openedUrls.push(url); },
       onExit: (outcome) => {
-        exited = true;
         attempts.set(accountId, { ...attempts.get(accountId), ...outcome, status: "finished" });
+        finished.resolve();
       },
     });
     assert.deepEqual(result, { opened: true, surface: "browser" });
     assert.deepEqual(openedUrls, ["https://auth.openai.com/oauth/authorize?state=test"]);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.equal(exited, true);
+    await finished.promise;
     const projected = projectChatGPTSubscriptionLoginAttempts({
       accounts: { [accountId]: { subscription: { usable: false } } },
     }, attempts);
@@ -95,6 +147,79 @@ test("ChatGPT browser login reports a terminal retry after child close without a
     });
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("failed ChatGPT handoff releases the queue while its writer finalizes once", { timeout: 2_000 }, async () => {
+  const source = await readFile(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("export function registerIpcHandlers(");
+  assert.ok(start >= 0);
+  for (const scenario of ["handoff-failure", "success", "finalize-failure", "before-spawn"]) {
+    const handlers = new Map();
+    let finalized = 0;
+    let cleared = 0;
+    let releaseFinalization;
+    const finalization = new Promise((resolve) => { releaseFinalization = resolve; });
+    const noop = () => {};
+    const register = vm.runInNewContext(
+      `${source.slice(start).replace(/^export /, "")}\nregisterIpcHandlers;`,
+      {
+        process: { pid: 1234, env: {} }, path: path.win32, Buffer, Error, URL,
+        os: { homedir: () => "C:/fixture" }, randomUUID: () => "operation",
+        cleanText: String, stringValue: String, CHATGPT_ACCOUNT_ID: /^acct_fixture$/,
+        CHATGPT_LOGIN_COMPLETION_TIMEOUT_MS: 600_000, CATALOG_MUTATION_TIMEOUT_MS: 1_320_000,
+        assertMutationCompatibility: noop, executablePath: () => "C:/fixture/codex.exe",
+        discoverSourceRoot: () => "C:/fixture/router",
+        createChatGPTLoginLease: () => ({ token: "fixture" }),
+        attachChatGPTLoginLease: (_id, lease) => lease,
+        chatGPTLoginAuthChanged: () => false,
+        clearChatGPTLoginLease: () => { cleared += 1; },
+        runJson: async (args) => {
+          if (args[1] === "status") return { accounts: { acct_fixture: { state: "active", subscription: { usable: false } } } };
+          if (args[1] === "home") return { home: "C:/fixture/pool/acct_fixture" };
+          assert.equal(args[1], "login-finalize");
+          finalized += 1;
+          await finalization;
+          if (scenario === "finalize-failure") throw new Error("finalizer failed");
+          return { loginFinalizationPending: false };
+        },
+        openBrowserCommand: (_executable, _args, _cwd, options) => {
+          if (scenario === "before-spawn") throw new Error("before-spawn");
+          options.onSpawn({ pid: 2345 });
+          queueMicrotask(() => options.onExit({ code: scenario === "success" ? 0 : 1 }));
+          return scenario === "handoff-failure" ? Promise.reject(new Error("handoff-failure")) : Promise.resolve({ opened: true });
+        },
+        readInstalledControlHealth: noop, cursorConnectorInstallSpec: noop,
+        runCursorConnectorCommand: noop, discoverInstalledCursorTunnelHostname: noop,
+        readRunningCursorProcesses: noop, runControlJson: noop, getHarnessSnapshot: noop,
+        cursorDesktopPath: noop, openclawDesktopPath: noop,
+        projectChatGPTSubscriptionLoginAttempts,
+      },
+    );
+    const lifecycle = register({
+      ipcMain: { handle: (name, callback) => handlers.set(name, callback) },
+      BrowserWindow: { getAllWindows: () => [] }, shell: { openExternal: async () => {} },
+    });
+    const login = handlers.get("router-control:loginChatGptSubscriptionAccount")({}, { accountId: "acct_fixture" });
+    if (scenario === "success" || scenario === "finalize-failure") assert.equal((await login).opened, true);
+    else await assert.rejects(login, new RegExp(scenario));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(finalized, scenario === "before-spawn" ? 0 : 1);
+    assert.equal(cleared, scenario === "before-spawn" ? 1 : 0);
+    assert.equal(lifecycle.hasActiveMutations(), scenario !== "before-spawn");
+    let drained = false;
+    const idle = lifecycle.whenMutationsIdle().then(() => { drained = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(drained, scenario === "before-spawn");
+    releaseFinalization();
+    await idle;
+    assert.equal(lifecycle.hasActiveMutations(), false);
+    if (scenario === "finalize-failure") {
+      const pool = await handlers.get("router-control:getChatGptAccountPool")({});
+      assert.equal(pool.loginAttempts.acct_fixture.status, "failed");
+      assert.equal(pool.loginAttempts.acct_fixture.error, "finalizer failed");
+    }
+    await handlers.get("router-control:openExternal")({}, { url: "https://example.com" });
   }
 });
 
@@ -266,7 +391,7 @@ test("a rejected browser handoff terminates the detached Codex login", async () 
   }
 });
 
-test("Control Center navigation accepts only one fixed widget destination", () => {
+test("Control Center navigation accepts only one fixed destination", () => {
   assert.deepEqual(controlCenterDestination(["electron", ".", NAVIGATION_ARGUMENT, "usage"]), {
     destination: "usage",
     sourceId: undefined,
@@ -281,7 +406,12 @@ test("Control Center navigation accepts only one fixed widget destination", () =
     ]),
     { destination: "usage", sourceId: "deepseek" },
   );
-  assert.equal(controlCenterDestination(["electron", ".", NAVIGATION_ARGUMENT, "settings"]), undefined);
+  // The tray's Settings item; its widget-facing URL parser still refuses it.
+  assert.deepEqual(controlCenterDestination(["electron", ".", NAVIGATION_ARGUMENT, "settings"]), {
+    destination: "settings",
+    sourceId: undefined,
+  });
+  assert.equal(controlCenterDestination(["electron", ".", NAVIGATION_ARGUMENT, "models"]), undefined);
   assert.equal(controlCenterDestination(["electron", ".", NAVIGATION_ARGUMENT]), undefined);
   assert.equal(controlCenterDestination([
     "electron", ".", NAVIGATION_ARGUMENT, "usage", NAVIGATION_SOURCE_ARGUMENT, "deep_seek",
@@ -298,11 +428,15 @@ test("Control Center navigation URLs are exact and source bounded", () => {
   assert.deepEqual(controlCenterNavigationURL(
     "codex-router://control-center/usage",
   ), { destination: "usage", sourceId: undefined });
+  assert.deepEqual(controlCenterNavigationURL(
+    "codex-router://control-center/settings",
+  ), { destination: "settings", sourceId: undefined });
   for (const value of [
     "https://control-center/usage",
     "codex-router://other/usage",
     "codex-router://control-center//usage",
-    "codex-router://control-center/settings",
+    "codex-router://control-center/models",
+    "codex-router://control-center/settings/",
     "codex-router://control-center/usage?source=deep_seek",
     "codex-router://control-center/usage?source=openai&source=deepseek",
     "codex-router://control-center/usage?next=settings",
@@ -637,22 +771,54 @@ test("Linux tray-only mode trusts only a positively registered StatusNotifier ho
 
 // The fixture records its descendant as soon as it is spawned, but the whole
 // command can be terminated before that write lands on a busy machine. Wait
-// briefly and say what happened: reading the file directly reported a bare
+// for a complete positive PID and say what happened: file existence can race
+// the write, and treating an empty file as ready passes NaN to process.kill.
+// Reading the file directly also reported a bare
 // ENOENT that read as a missing temp directory rather than a descendant that
 // never started.
 async function readPidFile(pidFile, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    try { return await readFile(pidFile, "utf8"); }
+    try {
+      const value = (await readFile(pidFile, "utf8")).trim();
+      if (/^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value))) return value;
+    }
     catch (error) {
       if (error?.code !== "ENOENT") throw error;
-      if (Date.now() >= deadline) {
-        assert.fail(`the command fixture never recorded a descendant pid in ${pidFile}`);
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
     }
+    if (Date.now() >= deadline) {
+      assert.fail(`the command fixture never recorded a valid descendant pid in ${pidFile}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
   }
 }
+
+test("command fixture PID readiness waits past an empty or malformed publication", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "command-pid-publication-"));
+  const pidFile = path.join(root, "descendant.pid");
+  try {
+    for (const initial of ["", "NaN", "123suffix", "0"]) {
+      await writeFile(pidFile, initial);
+      const reading = readPidFile(pidFile);
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      await writeFile(pidFile, String(process.pid));
+      assert.equal(await reading, String(process.pid));
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("command fixture PID readiness rejects a file that never becomes valid", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "command-pid-deadline-"));
+  const pidFile = path.join(root, "descendant.pid");
+  try {
+    await writeFile(pidFile, "");
+    await assert.rejects(readPidFile(pidFile, 50), /never recorded a valid descendant pid/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 async function waitForProcessExit(pid, timeoutMs = 4_000) {
   const deadline = Date.now() + timeoutMs;
@@ -675,21 +841,24 @@ async function makeProcessTreeControlRoot() {
     path.join(root, "src", "control.mjs"),
     [
       'import { spawn } from "node:child_process";',
-      'import { writeFileSync } from "node:fs";',
+      'import { renameSync, writeFileSync } from "node:fs";',
       'const [pidFile, mode] = process.argv.slice(2);',
       'const marker = `${pidFile}.survived`;',
       'const worker = `const { writeFileSync } = require("node:fs"); process.on("SIGTERM", () => {}); process.on("SIGINT", () => {}); setTimeout(() => writeFileSync(${JSON.stringify(marker)}, "unsafe"), 900); process.send?.("ready"); process.disconnect?.(); setInterval(() => {}, 1000)`;',
       // Hold the command's stdout/stderr pipes open after its leader exits, so
       // the runner has to act on `exit` rather than waiting forever for `close`.
       'const descendant = spawn(process.execPath, ["-e", worker], { stdio: ["ignore", "inherit", "inherit", "ipc"] });',
+      // Publish a complete value atomically; the owner may signal immediately
+      // after observing readiness and must never see a partial decimal PID.
+      'const recordPid = () => { writeFileSync(`${pidFile}.pending`, String(descendant.pid)); renameSync(`${pidFile}.pending`, pidFile); };',
       // The timeout mode is killed on a deadline, so record the descendant as
       // soon as it has a pid. Waiting for its IPC "ready" first put a second
       // Node startup inside that deadline, and a loaded runner spent it: the
       // tree was terminated correctly and the test then read no pid file at
       // all. The other modes still report after the handshake.
-      'if (mode === "timeout") writeFileSync(pidFile, String(descendant.pid));',
+      'if (mode === "timeout") recordPid();',
       'descendant.once("message", () => {',
-      '  if (mode !== "timeout") writeFileSync(pidFile, String(descendant.pid));',
+      '  if (mode !== "timeout") recordPid();',
       '  if (mode === "success") process.exit(0);',
       '  if (mode === "failure") process.exit(7);',
       '  if (mode === "overflow") process.stdout.write("x".repeat(4096));',
@@ -1674,9 +1843,12 @@ test("the model directory combines provider setup with de-duplicated model-famil
   assert.match(models, /className="pm-group-heading"/);
   assert.match(providerModelsCss, /\.pm-group-heading\s*\{/);
 
-  // The switch states its own value, and the disclosure sits at the far left
-  // so it cannot read as part of that switch.
-  assert.match(models, /className="pm-family-state" aria-hidden>\{on \? t\("models\.status\.on"\) : t\("models\.status\.off"\)\}/);
+  // Families expose their summary to readers; mutations stay on individual
+  // routes, including the shortcut for a family containing only one route.
+  assert.match(models, /className="pm-family-state">\{on \? t\("models\.status\.on"\) : t\("models\.status\.off"\)\}/);
+  assert.doesNotMatch(models, /updateFamilyPicker|onFamilyPicker/);
+  assert.match(models, /\{!multiRoute \? \([\s\S]{0,600}onChange=\{\(visible\) => onRoutePicker\(family\.routes\[0\], visible\)\}/);
+  assert.match(models, /onPickerChange=\{\(checked\) => onRoutePicker\(model, checked\)\}/);
   assert.match(models, /<ChevronDown className="pm-accordion-chevron"[\s\S]{0,80}<BrandLogo/);
   assert.match(providerModelsCss, /\.pm-family-open \{[^}]*grid-template-columns: 14px 38px/s);
 
@@ -1972,7 +2144,7 @@ test("harness and context IPC remain fixed and session-scoped", async () => {
       < chatgptLogin.indexOf("const opened = await openedPromise"),
     "every attached credential writer must own finalization before browser handoff settles",
   );
-  assert.match(chatgptLogin, /if \(loginFinalization\) \{[\s\S]*?await loginFinalization/);
+  assert.doesNotMatch(chatgptLogin, /await loginFinalization/);
   const chatgptRemove = source.match(/handleAction\("removeChatGptSubscriptionAccount"[\s\S]*?\n  \}\);/)?.[0];
   assert.ok(chatgptRemove, "ChatGPT subscription removal handler should be readable");
   assert.match(chatgptRemove, /"chatgpt-account-pool", "status"/);
@@ -2430,12 +2602,7 @@ for (const ownerSignal of ["SIGINT", "SIGTERM"]) {
       );
       let descendantPid;
       try {
-        const deadline = Date.now() + 3_000;
-        while (!existsSync(pidFile) && Date.now() < deadline) {
-          await new Promise((resolve) => setTimeout(resolve, 20));
-        }
-        assert.equal(existsSync(pidFile), true);
-        descendantPid = Number.parseInt(await readFile(pidFile, "utf8"), 10);
+        descendantPid = Number(await readPidFile(pidFile));
         owner.kill(ownerSignal);
         const [code, signal] = await once(owner, "exit");
         assert.equal(signal, null);
@@ -2717,40 +2884,49 @@ test("a custom endpoint id is derived from the name and never reuses a taken one
 });
 
 test("custom endpoint mutations refuse renderer input before spawning a router command", async () => {
-  const handlers = new Map();
-  const { registerIpcHandlers } = await import("../apps/control-center/electron/ipc.mjs");
-  registerIpcHandlers({
-    ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
-    BrowserWindow: { getAllWindows: () => [] },
-    shell: {},
-    senderGuard: () => true,
-  });
-  const add = handlers.get("router-control:addCustomEndpoint");
-  assert.equal(typeof add, "function");
-  // Every one of these must be refused by the validation above, before the
-  // handler reaches providerEntries() and spawns the router CLI.
-  await assert.rejects(add({}, { displayName: "", baseUrl: "https://api.example.com/v1" }), /Name/);
-  await assert.rejects(
-    add({}, { displayName: "x".repeat(121), baseUrl: "https://api.example.com/v1" }),
-    /at most 120/,
-  );
-  await assert.rejects(add({}, { displayName: "Ok", baseUrl: "ftp://example.com" }), /http or https/);
-  await assert.rejects(
-    add({}, { displayName: "Ok", baseUrl: "https://user:pass@example.com/v1" }),
-    /key in the key field/,
-  );
-  await assert.rejects(
-    add({}, { displayName: "Ok", baseUrl: "https://api.example.com/v1", adapter: "anthropic" }),
-    /API format is invalid/,
-  );
-  await assert.rejects(
-    add({}, { displayName: "Ok", baseUrl: "https://api.example.com/v1", credential: "k".repeat(16 * 1024 + 1) }),
-    /Credential is invalid/,
-  );
-  await assert.rejects(
-    add({}, { displayName: "Ok", baseUrl: "https://api.example.com/v1", credential: 42 }),
-    /Credential is invalid/,
-  );
+  // Validate input using this checkout: a separate installed router may be
+  // an older version, whose protocol guard would mask these assertions.
+  const previousSourceRoot = process.env.CODEX_ROUTER_SOURCE_ROOT;
+  process.env.CODEX_ROUTER_SOURCE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  try {
+    const handlers = new Map();
+    const { registerIpcHandlers } = await import("../apps/control-center/electron/ipc.mjs");
+    registerIpcHandlers({
+      ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
+      BrowserWindow: { getAllWindows: () => [] },
+      shell: {},
+      senderGuard: () => true,
+    });
+    const add = handlers.get("router-control:addCustomEndpoint");
+    assert.equal(typeof add, "function");
+    // Every one of these must be refused by the validation above, before the
+    // handler reaches providerEntries() and spawns the router CLI.
+    await assert.rejects(add({}, { displayName: "", baseUrl: "https://api.example.com/v1" }), /Name/);
+    await assert.rejects(
+      add({}, { displayName: "x".repeat(121), baseUrl: "https://api.example.com/v1" }),
+      /at most 120/,
+    );
+    await assert.rejects(add({}, { displayName: "Ok", baseUrl: "ftp://example.com" }), /http or https/);
+    await assert.rejects(
+      add({}, { displayName: "Ok", baseUrl: "https://user:pass@example.com/v1" }),
+      /key in the key field/,
+    );
+    await assert.rejects(
+      add({}, { displayName: "Ok", baseUrl: "https://api.example.com/v1", adapter: "anthropic" }),
+      /API format is invalid/,
+    );
+    await assert.rejects(
+      add({}, { displayName: "Ok", baseUrl: "https://api.example.com/v1", credential: "k".repeat(16 * 1024 + 1) }),
+      /Credential is invalid/,
+    );
+    await assert.rejects(
+      add({}, { displayName: "Ok", baseUrl: "https://api.example.com/v1", credential: 42 }),
+      /Credential is invalid/,
+    );
+  } finally {
+    if (previousSourceRoot === undefined) delete process.env.CODEX_ROUTER_SOURCE_ROOT;
+    else process.env.CODEX_ROUTER_SOURCE_ROOT = previousSourceRoot;
+  }
 });
 
 test("a crashing router child is reported as its message, not as a stack trace", () => {

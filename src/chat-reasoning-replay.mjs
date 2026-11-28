@@ -24,8 +24,8 @@ import { Transform } from "node:stream";
 //
 // Cost and safety:
 //   * only models that require the contract pay for the tap;
-//   * the parsers pre-check the raw chunk with a substring test before any
-//     JSON work, and keep at most one turn's text in memory;
+//   * the stream parser pre-checks complete data lines before any
+//     JSON work, and keeps at most one turn's text in memory;
 //   * the cache is a Map with LRU eviction by entry count and total characters;
 //   * reasoning is stored whole or not at all -- a truncated replay is not the
 //     same reasoning, and the model reads it as prose it once wrote;
@@ -36,6 +36,7 @@ const MAX_ENTRIES = 512;
 const MAX_CHARS = 400_000;
 const MAX_TURN_CHARS = 400_000;
 const MAX_JSON_RESPONSE_BYTES = 4 * 1024 * 1024;
+const REPLAY_FINISH_REASONS = new Set(["tool_calls", "stop"]);
 
 const byToolCall = new Map(); // tool_call id -> reasoning text, oldest first
 let storedChars = 0;
@@ -120,11 +121,14 @@ export function createReasoningReplayTap({ onStore } = {}) {
   let reasoning = "";
   let toolCallIds = [];
   let buffer = "";
+  let eligible = true;
+  const decoder = new TextDecoder("utf-8", { fatal: true });
 
-  const endsTurn = (payload) => {
-    if (payload === "[DONE]") return true;
-    const finish = payload?.choices?.[0]?.finish_reason;
-    return typeof finish === "string" && finish.length > 0;
+  const discard = () => {
+    eligible = false;
+    reasoning = "";
+    toolCallIds = [];
+    buffer = "";
   };
 
   const ingest = (payload) => {
@@ -133,6 +137,7 @@ export function createReasoningReplayTap({ onStore } = {}) {
     const message = choice.message;
     if (message && typeof message === "object") {
       if (typeof message.reasoning_content === "string" && message.reasoning_content) {
+        if (message.reasoning_content.length > MAX_TURN_CHARS) return discard();
         reasoning = message.reasoning_content;
       }
       const ids = collectToolCallIds(message.tool_calls);
@@ -141,13 +146,13 @@ export function createReasoningReplayTap({ onStore } = {}) {
     const delta = choice.delta;
     if (delta && typeof delta === "object") {
       if (typeof delta.reasoning_content === "string") {
-        if (reasoning.length + delta.reasoning_content.length <= MAX_TURN_CHARS) {
-          reasoning += delta.reasoning_content;
-        }
+        if (reasoning.length + delta.reasoning_content.length > MAX_TURN_CHARS) return discard();
+        reasoning += delta.reasoning_content;
       }
       const ids = collectToolCallIds(delta.tool_calls);
       if (ids.length) toolCallIds = [...new Set([...toolCallIds, ...ids])];
     }
+    if (toolCallIds.length > MAX_ENTRIES) discard();
   };
 
   const finish = () => {
@@ -155,46 +160,59 @@ export function createReasoningReplayTap({ onStore } = {}) {
       const stored = rememberReasoningForToolCalls(toolCallIds, reasoning);
       onStore?.({ stored, chars: reasoning.length, toolCallIds });
     }
-    reasoning = "";
-    toolCallIds = [];
+    discard();
+  };
+
+  const observe = (text) => {
+    buffer += text;
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    if (buffer.length > MAX_JSON_RESPONSE_BYTES) return discard();
+    for (const line of lines) {
+      if (!eligible) break;
+      if (!line.startsWith("data:")) continue;
+      const payloadText = line.slice(5).trim();
+      if (payloadText === "[DONE]") {
+        discard();
+        continue;
+      }
+      // HTTP chunks may split both the field name and its value. Only a
+      // complete line can prove whether the event is relevant to replay.
+      try {
+        const payload = JSON.parse(payloadText);
+        if (payload?.error) return discard();
+        ingest(payload);
+        const reason = payload?.choices?.[0]?.finish_reason;
+        if (eligible && reason !== undefined && reason !== null) {
+          if (REPLAY_FINISH_REASONS.has(reason)) finish();
+          else discard();
+        }
+      } catch {
+        discard();
+      }
+    }
   };
 
   return new Transform({
     transform(chunk, _encoding, callback) {
       try {
-        const text = chunk.toString("utf8");
-        buffer += text;
-        // Cheap pre-check: skip JSON work for chunks that cannot carry either.
-        if (text.includes("reasoning_content") || text.includes("tool_calls") || text.includes("finish_reason")) {
-          const lines = buffer.split("\n");
-          buffer = lines.pop() ?? "";
-          for (const line of lines) {
-            if (!line.startsWith("data:")) continue;
-            const payloadText = line.slice(5).trim();
-            if (!payloadText) continue;
-            if (payloadText === "[DONE]") {
-              finish();
-              continue;
-            }
-            try {
-              const payload = JSON.parse(payloadText);
-              ingest(payload);
-              if (endsTurn(payload)) finish();
-            } catch {
-              // A partial or non-JSON data line is not this tap's business.
-            }
-          }
-        } else if (buffer.includes("\n")) {
-          const lines = buffer.split("\n");
-          buffer = lines.pop() ?? "";
-        }
+        if (eligible) observe(decoder.decode(chunk, { stream: true }));
       } catch {
-        // Observation must never disturb the relay.
+        // Invalid UTF-8 cannot supply the model's exact reasoning. Stop
+        // observing, while still forwarding every original byte unchanged.
+        discard();
       }
       callback(null, chunk);
     },
     flush(callback) {
-      finish();
+      try {
+        if (eligible) {
+          observe(decoder.decode());
+          discard();
+        }
+      } catch {
+        // Observation must never disturb the relay, including decoder flush.
+      }
       callback();
     },
   });
@@ -226,7 +244,7 @@ export function createReasoningReplayJsonTap({ onStore } = {}) {
           const payload = JSON.parse(decoded);
           if (!Array.isArray(payload?.choices)) throw new Error("missing choices");
           for (const choice of payload.choices) {
-            if (choice?.finish_reason !== "tool_calls" && choice?.finish_reason !== "stop") continue;
+            if (!REPLAY_FINISH_REASONS.has(choice?.finish_reason)) continue;
             const reasoning = choice.message?.reasoning_content;
             const toolCallIds = collectToolCallIds(choice.message?.tool_calls);
             const stored = rememberReasoningForToolCalls(toolCallIds, reasoning);

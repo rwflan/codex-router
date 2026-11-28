@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import path from "node:path";
 
+import { acquireFileLock, runWithLockRelease } from "./file-lock.mjs";
 import { writePrivateJsonAsync } from "./file-security.mjs";
 import { PROVIDERS } from "./model-registry.mjs";
 import { PROVIDER_API_KEY_POOL_PATH, STATE_DIR } from "./paths.mjs";
@@ -715,7 +716,13 @@ async function selectFromState(providerOrId, options = {}) {
   let selectedByPolicy = false;
   if (!selectedEntry) {
     selectedByPolicy = true;
-    selectedEntry = { meta: chooseMeta(pool, resolved.entries.map((entry) => entry.meta), at) };
+    const candidates = resolved.entries.map((entry) => entry.meta);
+    // Catalog provenance needs a stable account while ordinary traffic moves
+    // the cursor or updates quota rankings. Only non-committing previews may
+    // opt in; eligibility and the locked dispatch policy remain authoritative.
+    selectedEntry = { meta: options.commit === false && options.stable === true
+      ? orderMeta(pool, candidates)[0]
+      : chooseMeta(pool, candidates, at) };
     selectedEntry.value = resolved.entries.find((entry) => entry.meta.id === selectedEntry.meta.id)?.value;
     rebound = Boolean(bound && selectedEntry.meta && selectedEntry.meta.id !== bound.credentialId);
   }
@@ -758,10 +765,6 @@ export async function withProviderApiKeyPoolLock(operation, {
   retryMs = DEFAULT_LOCK_RETRY_MS,
   staleMs = DEFAULT_LOCK_STALE_MS,
 } = {}) {
-  // Catalog/setup import the read-only authority path before dependency repair
-  // runs. Load the third-party lock implementation only for an actual
-  // mutation so a missing node_modules can still reach that repair step.
-  const { default: lockfile } = await import("proper-lockfile");
   const directory = path.dirname(filePath);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const normalizedWait = Math.max(0, Math.floor(Number(waitMs) || 0));
@@ -769,7 +772,7 @@ export async function withProviderApiKeyPoolLock(operation, {
   const retries = Math.max(0, Math.ceil(normalizedWait / normalizedRetry) - 1);
   let release;
   try {
-    release = await lockfile.lock(lockTarget(filePath), {
+    release = await acquireFileLock(lockTarget(filePath), {
       realpath: false,
       lockfilePath: `${filePath}.pool-lock`,
       stale: Math.max(2_000, Math.floor(Number(staleMs) || DEFAULT_LOCK_STALE_MS)),
@@ -785,11 +788,7 @@ export async function withProviderApiKeyPoolLock(operation, {
     if (error?.code === "ELOCKED") throw lockError(normalizedWait, error);
     throw error;
   }
-  try {
-    return await operation();
-  } finally {
-    await release();
-  }
+  return runWithLockRelease(operation, release);
 }
 
 async function mutatePool(filePath, operation) {
@@ -1045,6 +1044,7 @@ export async function runProviderApiKeyAttempts(providerOrId, {
   const startedAt = now();
   const limit = Math.min(DEFAULT_ATTEMPT_LIMIT, Math.max(1, Math.floor(maxAttempts)));
   for (let index = 0; index < limit; index += 1) {
+    if (index > 0 && now() - startedAt >= budgetMs) break;
     if (typeof isResponseCommitted === "function" && isResponseCommitted()) {
       return { configured: true, valid: true, providerId: provider, attempts, committed: true, reason: "response_committed" };
     }
@@ -1063,6 +1063,8 @@ export async function runProviderApiKeyAttempts(providerOrId, {
     if (!selection.credentialId || !selection.credentialValue) {
       return { configured: true, valid: true, providerId: provider, attempts, reason: selection.reason };
     }
+    // Selection can wait on a lock; the budget bounds extra dispatches, not the first request.
+    if (index > 0 && now() - startedAt >= budgetMs) break;
     attempted.add(selection.credentialId);
     let result;
     let error;

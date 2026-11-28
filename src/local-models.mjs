@@ -11,7 +11,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 
-import { protectPrivateFile } from "./file-security.mjs";
+import { writePrivateFile } from "./file-security.mjs";
 import {
   disableProvider,
   enableProvider,
@@ -28,6 +28,7 @@ import {
   localOllamaRuntimeSnapshot,
   ollamaCommand,
   ollamaModelsPath,
+  probeOllama,
 } from "./ollama-runtime.mjs";
 import { readLocalDownload, writeLocalDownload } from "./local-download.mjs";
 import {
@@ -73,14 +74,7 @@ function writeSelection(selection) {
   const dir = path.dirname(LOCAL_MODELS_STATE_PATH);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   chmodSync(dir, 0o700);
-  const temporary = `${LOCAL_MODELS_STATE_PATH}.tmp.${process.pid}`;
-  writeFileSync(temporary, `${JSON.stringify(selection, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  protectPrivateFile(temporary);
-  renameSync(temporary, LOCAL_MODELS_STATE_PATH);
-  protectPrivateFile(LOCAL_MODELS_STATE_PATH);
+  writePrivateFile(LOCAL_MODELS_STATE_PATH, `${JSON.stringify(selection, null, 2)}\n`);
   return selection;
 }
 
@@ -361,15 +355,17 @@ function writeCapabilityCache(models) {
 // Keyed by the model's content id, so a retagged or rebuilt model is re-read
 // while an unchanged one costs no subprocess at all -- the tray polls this.
 export function localModelCapabilities(tag, id, { spawn = spawnSync, cache } = {}) {
-  const store = cache || readCapabilityCache();
-  const key = id || tag;
-  if (store[key]) return store[key];
+  // A tag can be replaced without changing its name. Only content IDs are cache keys.
+  const store = id ? cache || readCapabilityCache() : undefined;
+  if (store?.[id]) return store[id];
   try {
     const result = spawn(localOllamaBinary(spawn), ["show", tag], { encoding: "utf8" });
     if (result.status !== 0 || typeof result.stdout !== "string") return [];
     const capabilities = parseOllamaCapabilities(result.stdout);
-    store[key] = capabilities;
-    if (!cache) writeCapabilityCache(store);
+    if (store) {
+      store[id] = capabilities;
+      if (!cache) writeCapabilityCache(store);
+    }
     return capabilities;
   } catch {
     return [];
@@ -401,7 +397,7 @@ export function parseOllamaList(stdout) {
 
 export function localModelInventory({ spawn = spawnSync } = {}) {
   try {
-    const result = spawn(localOllamaBinary(spawn), ["list"], { encoding: "utf8" });
+    const result = spawn(localOllamaBinary(spawn), ["list"], { encoding: "utf8", timeout: 2000, windowsHide: true });
     if (result.status !== 0 || typeof result.stdout !== "string") return [];
     return parseOllamaList(result.stdout);
   } catch {
@@ -414,7 +410,7 @@ export function localModelInventory({ spawn = spawnSync } = {}) {
 // request pays a load penalty the operator should be able to see coming.
 export function runningLocalModels({ spawn = spawnSync } = {}) {
   try {
-    const result = spawn(localOllamaBinary(spawn), ["ps"], { encoding: "utf8" });
+    const result = spawn(localOllamaBinary(spawn), ["ps"], { encoding: "utf8", timeout: 2000, windowsHide: true });
     if (result.status !== 0 || typeof result.stdout !== "string") return [];
     return parseOllamaList(result.stdout).map((entry) => entry.tag);
   } catch {
@@ -422,30 +418,28 @@ export function runningLocalModels({ spawn = spawnSync } = {}) {
   }
 }
 
+// On Windows, invoking Ollama's installed executable with `list` while its
+// server is off can launch the desktop app and never return. Probe the loopback
+// API first so status reads remain read-only and bounded.
+export async function localModelStatusInputs({
+  probe = probeOllama,
+  inventory = localModelInventory,
+  running = runningLocalModels,
+  runtime = localOllamaRuntimeSnapshot,
+} = {}) {
+  const serverReachable = (await probe()).reachable === true;
+  return {
+    inventory: serverReachable ? inventory() : [],
+    running: serverReachable ? running() : [],
+    runtime: runtime({ serverReachable }),
+  };
+}
+
 // Answers "is this model checked?" across spellings, so a caller holding
 // `gemma3` and a state file holding `gemma3:latest` agree.
 export function isLocalModelEnabled(tag, selection = readLocalModelSelection()) {
   const canonical = canonicalLocalModelTag(tag);
   return selection.enabled.some((entry) => canonicalLocalModelTag(entry) === canonical);
-}
-
-// Deleting reclaims gigabytes and cannot be undone without downloading again,
-// so the caller must pass explicit consent rather than this inferring it.
-export function removeLocalModel(tag, { spawn = spawnSync, confirmed = false, capabilitiesFor } = {}) {
-  const value = String(tag || "").trim();
-  if (!value) throw new Error("A model tag is required.");
-  if (!confirmed) {
-    throw new Error(`Removing ${value} deletes it from disk. Pass --yes to confirm.`);
-  }
-  const result = spawn(localOllamaBinary(spawn), ["rm", value], { encoding: "utf8" });
-  if (result.status !== 0) {
-    const detail = String(result.stderr || "").trim();
-    throw new Error(`\`ollama rm ${value}\` failed${detail ? `: ${detail}` : "."}`);
-  }
-  // A deleted model cannot stay checked, or the picker would offer something
-  // that is no longer on disk.
-  setLocalModelEnabled(value, false, capabilitiesFor ? { capabilitiesFor } : undefined);
-  return value;
 }
 
 // One view the tray can render directly: what is installed, what is checked,
@@ -1106,6 +1100,8 @@ function ggufReader(buffer) {
   };
   return {
     u8() { need(1); return buffer[offset++]; },
+    u16() { need(2); const value = buffer.readUInt16LE(offset); offset += 2; return value; },
+    i16() { need(2); const value = buffer.readInt16LE(offset); offset += 2; return value; },
     u32() { need(4); const value = buffer.readUInt32LE(offset); offset += 4; return value; },
     i32() { need(4); const value = buffer.readInt32LE(offset); offset += 4; return value; },
     u64() { need(8); const value = Number(buffer.readBigUInt64LE(offset)); offset += 8; return value; },
@@ -1126,7 +1122,8 @@ function ggufReader(buffer) {
 // knowable by walking it -- tokenizer vocabularies are arrays of strings.
 function readGgufValue(reader, type) {
   if (type === GGUF_UINT8 || type === GGUF_INT8 || type === GGUF_BOOL) return reader.u8();
-  if (type === GGUF_UINT16 || type === GGUF_INT16) return reader.u32() & 0xffff;
+  if (type === GGUF_UINT16) return reader.u16();
+  if (type === GGUF_INT16) return reader.i16();
   if (type === GGUF_UINT32) return reader.u32();
   if (type === GGUF_INT32) return reader.i32();
   if (type === GGUF_FLOAT32) return reader.f32();

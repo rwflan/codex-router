@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Local CI, the merge gate (run it with `fleet ci`): repository checks, then
+# the full test suite.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+[ -d node_modules ] || npm ci --no-audit --no-fund >/dev/null
+node scripts-check.mjs
+node --test --test-timeout=600000 test/*.test.mjs
+echo "local CI passed"

@@ -36,7 +36,6 @@ export interface HarnessDescriptor {
     | "nousresearch";
   description: string;
   cliInstalled: boolean;
-  cliVersion?: string;
   appInstalled: boolean;
   configured: boolean;
   canInstall: boolean;
@@ -173,6 +172,7 @@ export interface RouterControl {
   discoverProviderModels(provider: string, options?: { refresh?: boolean }): Promise<unknown>;
   getAccountUsage(): Promise<unknown>;
   getProviderUsage(): Promise<unknown>;
+  getFreePool(): Promise<unknown>;
   getLocalModels(): Promise<unknown>;
   getVisionBridge(): Promise<unknown>;
   getToolResultAging(): Promise<unknown>;
@@ -240,7 +240,7 @@ export interface RouterControl {
   openHarnessSession(harnessId: HarnessId, sessionId: string, surface: HarnessSurface, model?: string): Promise<unknown>;
   openExternal(url: string): Promise<void>;
   onNavigation?(listener: (request: {
-    destination: "usage" | "usage-resets";
+    destination: "usage" | "usage-resets" | "settings";
     sourceId?: string;
   }) => void): () => void;
   onOperation(listener: (event: { id?: string; name?: string; action?: string; status: string; message?: string; error?: string }) => void): () => void;

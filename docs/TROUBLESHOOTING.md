@@ -1,5 +1,7 @@
 # Troubleshooting
 
+English · [简体中文](zh-CN/TROUBLESHOOTING.md) · [日本語](ja/TROUBLESHOOTING.md)
+
 Start with:
 
 ```sh
@@ -24,6 +26,20 @@ Neither command prints credential values. Repair refuses unknown router owners.
 ## New native models (GPT-6 Astra, GPT-7, etc.)
 
 **Uninstall is never required** to see new OpenAI/Codex native models. While its merged catalog is installed, the router conditionally refreshes the signed-in account catalog itself, watches the resulting model fingerprint plus a lightweight fingerprint of the resolved Codex executable, and republishes when either source changes. A failed or unavailable account request leaves the prior cache untouched and falls back to that cache plus the bundled catalog. Discovery-disabled installs make no account request. Drift is checked on startup and periodically while the router stays running.
+
+The periodic check defaults to five minutes. To check once per day, set
+`CODEX_ROUTER_NATIVE_CATALOG_POLL_INTERVAL_MS=86400000`. Accepted values are
+integer milliseconds from `300000` to `2147483647`; invalid values retain the
+five-minute default. This changes only the periodic check: startup still checks
+immediately, the account-cache freshness TTL remains five minutes, and a manual
+`refresh-catalog` still forces a refresh. A longer interval can delay automatic
+discovery of account or executable changes until the next check.
+
+Pass the setting when installing the service; the macOS, Linux, and Windows
+renderers persist its normalized value. For an existing service, set it in the
+launchd environment, systemd environment, or Windows launcher and reload the
+service definition. A process restart alone does not reload a changed launchd
+property list. Restart the router after changing its environment.
 
 **Codex full quit/reopen is still required** to reload the catalog file. Codex reads `model_catalog_json` once at startup; the router cannot make Codex hot-reload.
 
@@ -363,35 +379,21 @@ line. The forwarder now accepts all three shapes and restores final tool
 arguments without holding the full turn, so Codex sees the tool call instead of
 mistaking the preceding status text for the completed task.
 
-A remaining Grok OAuth shape is a progress-only stop: the model reasons,
-emits a status sentence, and never calls a tool. On turns following a user
-message, attempt 1 still streams live; when the client offered tools and the
-short-text/token trigger fires, the forwarder retries once and appends a
-retry tool call onto the same stream. On turns following a tool result, the
-stricter certified-repair path opens the response as soon as xAI returns its
-headers and relays reasoning, but stages the short visible answer until the
-terminal event proves it is safe.
-After a conversation has exhibited that shape once, later user-message turns
-buffer only a short visible prefix up to the same text threshold. Headers and
-preceding reasoning remain live, and a tool call or longer answer releases the
-prefix; if the upstream stream aborts instead, Codex receives the terminal
-stream error without first recording another partial progress sentence. Unaffected
-conversation IDs retain the fully live path, and the evidence set is bounded
-in memory.
+A completed short answer is not evidence that Grok stalled. The forwarder
+accepts native text regardless of its length or reasoning-token count. It no
+longer repeats user-message generations based on that heuristic or remembers
+conversation IDs to buffer their later short replies. The old
+`CODEX_ROUTER_GROK_PROGRESS_ONLY_MIN_OUTPUT_TOKENS` and
+`CODEX_ROUTER_GROK_PROGRESS_ONLY_MAX_TEXT` settings no longer apply.
 
-The trigger is a shape, not a diagnosis, and it is worth knowing which turns
-pay for it. After a tool result, every no-tool prose response is held and
-repaired once — no language match, token floor, or length threshold. The
-repair must call exactly one function: either a client tool or the private
-router final-answer tool. The latter is converted to ordinary assistant text
-and never reaches Codex. A retry that does neither returns an explicit 502; it
-is never converted into a clean `stop`. After a user message the older rule
-remains: both a finished one-liner and a stalled plan retry when output tokens
-clear the floor, and the nudge offers the no-tool branch first so "Yes, that
-is correct." is not talked into a call the client would then run. Raise
-`CODEX_ROUTER_GROK_PROGRESS_ONLY_MIN_OUTPUT_TOKENS` or lower
-`CODEX_ROUTER_GROK_PROGRESS_ONLY_MAX_TEXT` to fire less often on that
-user-message path; those settings do not weaken the post-tool invariant.
+After a tool result, the forwarder still offers client tools and a private
+final-answer tool. Native completed prose is also accepted. It relays reasoning
+but holds actions until a successful terminal, so a partial action followed by
+failure cannot reach the client. Only an empty completed response with no tool
+call triggers one recovery request. That recovery must produce completed text,
+a valid private final answer, or valid client tools; otherwise it fails explicitly.
+Malformed or mixed calls and unsuccessful terminals are never repaired into
+success. Explicit caller tool choices remain authoritative.
 
 For a quiet worker, run `bin/control activity <thread-id>` from the installed
 checkout (on Windows, `codex-router.ps1 activity <thread-id>` from
@@ -414,7 +416,7 @@ whether the user or a parent agent initiated it. Wait timeouts and quiet streams
 are not authorization to replace a worker. Consult its native task state and
 confirm that the old writer has stopped before starting another.
 
-Both attempts are billed. The usage returned to Codex reports only the
+When an empty post-tool response requires recovery, both attempts are billed. The usage returned to Codex reports only the
 selected attempt's context size, while the local ledger retains the aggregate
 as billed input/output tokens. The response sets
 `progress_only_retried: true`, and the log line `progress-only-retried=true`
@@ -482,6 +484,21 @@ When the forwarder rejects a failed Grok
 attempt, its `upstream-terminal-failed=true` log line carries any
 provider-reported `input_tokens` and `output_tokens`; the router's usage row for
 that attempt has no token counts.
+
+Z.ai Coding Plan (`zai-coding`) reasoning streams have an independent three-minute
+idle deadline after the prologue is released. GLM can pause between reasoning
+events for more than thirty seconds, so applying the short prelude budget here
+can close a healthy turn before `response.completed`. Set
+`CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS` to an integer from `1` to `240000`
+milliseconds to override the `180000` default. Pass it when installing the
+service; the macOS, Linux, and Windows renderers persist the normalized value.
+For an existing service, set it in the launchd environment, systemd environment,
+or Windows launcher and reload that service definition; a process restart alone
+does not reload a changed launchd property list.
+Invalid values retain the default. This deadline stays below the shared transport
+and Codex client idle bounds; it adds no heartbeat. Headers-only responses retain
+the initial prelude budget, empty completions retain their guard, and a visible
+stream is never replayed. Grok's separate deadline and other routes are unchanged.
 
 Operators diagnosing an unusually slow upstream can temporarily change the
 30-second bound with `CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS` and the 1 MiB
@@ -572,6 +589,29 @@ migrates only recognized earlier repository services and otherwise stops with a
 conflict.
 
 ## The background service is stopped
+
+Repeated automatic startup probe timeouts or unavailable Windows identity
+probes pause the next attempt for 1, 2, 4, 8, then at most 15 minutes. The service
+log says `backing off` and Windows may report `LastTaskResult=0x45` (exit 69).
+Configuration, credential, child-exit and mismatched-identity failures still
+need repair; the cooldown does not make them healthy.
+
+Use `node src/service.mjs start` or `node src/service.mjs restart` to reset the
+cooldown. A reset that fails reports an error before launching. A replacement
+also resets after the old service stops, so an old failure cannot hold it back.
+`bin/start --foreground` (Windows: `codex-router.ps1 start --foreground`) keeps
+its existing lifecycle lock and neither reads nor changes managed cooldown.
+
+To disable automatic cooldown persistently, set
+`CODEX_ROUTER_DISABLE_STARTUP_BACKOFF=1` when installing or regenerating the
+service definition; `0` restores it. Merely setting it in a shell before
+starting an already-installed service does not change that service's recorded
+environment. A direct payload run reads the shell setting; foreground startup
+always bypasses the cooldown.
+
+If an install reports that automatic startup is deferred, its service remains
+registered and the command returns temporary-failure status 75. Inspect the
+service log, resolve the startup problem, and use start or restart to reset it.
 
 macOS:
 
@@ -666,7 +706,13 @@ are preserved.
 
 ## Retained tool results are using disk
 
-Tool-result compaction can park the exact original bytes of a result it rewrote
+When enabled, tool-result aging can preserve exact textual originals before
+rewriting eligible old results. Local omission requires verified readback access
+for the same conversation/permission scope. Missing or invalid access proofs and
+failed archive writes keep the full result in the request. See the
+[Codex archive guide](CODEX.md#tool-result-aging-and-exact-archive-readback).
+
+The exact textual original is stored
 in `<state dir>/retained-tool-results`. That store is owner-only, is excluded
 from support bundles, and is bounded rather than evicting — at its cap it stops
 accepting new results and eligible results pass through uncompacted.
@@ -682,12 +728,14 @@ of the oldest entry, and the TTL. To empty it:
 Without `--yes` nothing is deleted. The purge removes only files the store
 itself wrote, only inside that one directory, and refuses to follow a symlink
 out of it; anything else that ends up there is reported and left alone. Deleting
-retained bytes is not reversible — a compacted result in an open session keeps
-its hash and head/tail evidence, but the original is gone.
+retained bytes is not reversible. Open sessions can retain archive handles,
+but those handles cannot recover a deleted original. The local reader must
+report it as unavailable historical evidence; rerunning the source command
+would create a new observation, not recover the old one.
 
-Retained results expire after 7 days by default, so most stores never need a
-purge at all. Nothing sweeps on a timer: entries expire when the store is next
-written to. On an install where compaction is off, or one that filled before the
+Retained results expire after 7 days by default. Reads reject expired evidence
+even when its file has not yet been removed. Nothing sweeps on a timer:
+entries expire when the store is next written to. On an install where compaction is off, or one that filled before the
 TTL existed, nothing is going to write again — run the sweep by hand:
 
 ```sh
@@ -705,7 +753,8 @@ not stop expiry.
 
 ## Uninstall retained files
 
-This is intentional. `./bin/uninstall` removes only the active integration and
-background service. The state directory may contain credentials, logs, catalog
+This is intentional. `./bin/uninstall` removes the selected integration and
+retires the shared background service only when no installed client still
+uses it. The state directory may contain credentials, logs, catalog
 caches, install history, and rollback snapshots. Inspect it manually before
 deleting anything.
